@@ -1,5 +1,10 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.150] — 2026-04-22
+
+### Fixed
+- **Profile switching state** — switching back to the `default` profile now persistently sets `hermes_profile=default` in the cookie instead of clearing it, preventing fallback to the process-global profile on subsequent requests. Replaces a previously undefined `updateWorkspaceChip()` call with `syncTopbar()` in the sidebar profile-switch flow, and makes profile-card active-indicator rendering prefer the client's current `S.activeProfile` state. (`api/helpers.py`, `static/panels.js`) (PR #849 by @migueltavares)
+
 ## [v0.50.147] — 2026-04-22
 
 ### Fixed
