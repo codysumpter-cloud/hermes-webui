@@ -1,5 +1,10 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.148] — 2026-04-22
+
+### Fixed
+- **Session list ghost entries** — stale `_index.json` rows left behind after session-id rotation are now pruned on both incremental index writes and `all_sessions()` reads, eliminating duplicate session entries after context compression. Also optimises the `all_sessions()` path to snapshot in-memory session IDs under a single lock acquisition rather than one per row. (`api/models.py`) (PR #847 by @franksong2702, closes #846)
+
 ## [v0.50.147] — 2026-04-22
 
 ### Fixed

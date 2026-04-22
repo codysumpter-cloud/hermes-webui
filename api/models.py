@@ -236,9 +236,11 @@ def all_sessions():
     if SESSION_INDEX_FILE.exists():
         try:
             index = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+            with LOCK:
+                in_memory_ids = set(SESSIONS.keys())
             index = [
                 s for s in index
-                if _index_entry_exists(s.get('session_id'))
+                if _index_entry_exists(s.get('session_id'), in_memory_ids=in_memory_ids)
             ]
             # Overlay any in-memory sessions that may be newer than the index
             index_map = {s['session_id']: s for s in index}
