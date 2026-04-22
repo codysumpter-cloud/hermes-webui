@@ -1,5 +1,10 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.149] — 2026-04-22
+
+### Fixed
+- **Session first-open side-effect** — `GET /api/session` now resolves an effective display model for stale-model sessions without writing the corrected value back to disk. Removes an unnecessary session file write on the read path, preventing unnecessary index updates on first open. (`api/routes.py`) (PR #848 by @franksong2702, closes #845)
+
 ## [v0.50.147] — 2026-04-22
 
 ### Fixed
