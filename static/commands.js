@@ -11,18 +11,25 @@ const COMMANDS=[
   {name:'compact',   desc:t('cmd_compact_alias'),       fn:cmdCompact, noEcho:true},
   {name:'model',     desc:t('cmd_model'),  fn:cmdModel,     arg:'model_name', subArgs:'models', noEcho:true},
   {name:'workspace', desc:t('cmd_workspace'),            fn:cmdWorkspace, arg:'name',           noEcho:true},
+  {name:'terminal',  desc:t('cmd_terminal'),             fn:cmdTerminal,                        noEcho:true},
   {name:'new',       desc:t('cmd_new'),            fn:cmdNew,       noEcho:true},
   {name:'usage',     desc:t('cmd_usage'),   fn:cmdUsage,     noEcho:true},
   {name:'theme',     desc:t('cmd_theme'), fn:cmdTheme, arg:'name',  noEcho:true},
   {name:'personality', desc:t('cmd_personality'), fn:cmdPersonality, arg:'name', subArgs:'personalities'},
   {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'query'},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
+  {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'message', noEcho:true},
+  {name:'interrupt', desc:t('cmd_interrupt'), fn:cmdInterrupt, arg:'message', noEcho:true},
+  {name:'steer',     desc:t('cmd_steer'),    fn:cmdSteer,     arg:'message', noEcho:true},
   {name:'title',     desc:t('cmd_title'),    fn:cmdTitle,    arg:'[title]'},
   {name:'retry',     desc:t('cmd_retry'),    fn:cmdRetry,     noEcho:true},
   {name:'undo',      desc:t('cmd_undo'),     fn:cmdUndo,      noEcho:true},
+  {name:'btw',       desc:t('cmd_btw'),      fn:cmdBtw,       arg:'question', noEcho:true},
+  {name:'background',desc:t('cmd_background'),fn:cmdBackground,arg:'prompt',  noEcho:true},
   {name:'status',    desc:t('cmd_status'),   fn:cmdStatus},
   {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
   {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh', subArgs:['show','hide','none','minimal','low','medium','high','xhigh'], noEcho:true},
+  {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
 ];
 
 const SLASH_SUBARG_SOURCES={
@@ -256,6 +263,26 @@ async function cmdWorkspace(args){
   }catch(e){showToast(t('workspace_switch_failed')+e.message);}
 }
 
+async function cmdTerminal(){
+  if(!S.session&&typeof newSession==='function'){
+    if(!S._profileSwitchWorkspace&&!S._profileDefaultWorkspace){
+      try{
+        const data=await api('/api/workspaces');
+        const first=(data.workspaces||[])[0];
+        S._profileSwitchWorkspace=data.last||(first&&first.path)||null;
+      }catch(_){}
+    }
+    await newSession();
+    if(typeof renderSessionList==='function') await renderSessionList();
+  }
+  if(!S.session||!S.session.workspace){
+    showToast(t('terminal_no_workspace_title'),2600,'warning');
+    if(typeof syncTerminalButton==='function') syncTerminalButton();
+    return;
+  }
+  if(typeof toggleComposerTerminal==='function') await toggleComposerTerminal(true);
+}
+
 async function cmdNew(){
   if(typeof clearCompressionUi==='function') clearCompressionUi();
   await newSession();
@@ -279,6 +306,7 @@ async function _runManualCompression(focusTopic){
       S.session=live.session;
       S.messages=live.session.messages||[];
       S.toolCalls=live.session.tool_calls||[];
+      if(typeof _messagesTruncated!=='undefined') _messagesTruncated=false;
     }catch(preflightErr){
       if(typeof clearCompressionUi==='function') clearCompressionUi();
       if(typeof _setCompressionSessionLock==='function') _setCompressionSessionLock(null);
@@ -529,6 +557,127 @@ async function cmdStop(){
   if(typeof cancelStream==='function'){await cancelStream();showToast(t('stream_stopped'));}
   else showToast(t('cancel_unavailable'));
 }
+
+// ── Busy-input mode commands ──────────────────────────────────────────────
+// These commands let users override the default busy_input_mode setting for a
+// specific message.  They are only meaningful while the agent is running.
+
+/**
+ * /queue <message> — Explicitly queue a message for the next turn.
+ * Works regardless of the busy_input_mode setting.
+ */
+async function cmdQueue(args){
+  const msg=(args||'').trim();
+  if(!msg){showToast(t('cmd_queue_no_msg'));return;}
+  // If nothing is running, /queue <msg> just sends like a normal message
+  if(!S.busy){
+    const inp=$('msg');
+    if(inp){inp.value=msg;}
+    if(typeof send==='function'){await send();}
+    return;
+  }
+  if(!S.session){showToast(t('no_active_session'));return;}
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  updateQueueBadge(S.session.session_id);
+  S.pendingFiles=[];renderTray();
+  showToast(t('cmd_queue_confirm'),2000);
+}
+
+/**
+ * /interrupt <message> — Cancel the current turn and send a new message.
+ * Calls cancelStream() then queues the message so the drain picks it up.
+ */
+async function cmdInterrupt(args){
+  const msg=(args||'').trim();
+  if(!msg){showToast(t('cmd_interrupt_no_msg'));return;}
+  // If nothing is running, /interrupt <msg> just sends like a normal message
+  if(!S.busy||!S.activeStreamId){
+    const inp=$('msg');
+    if(inp){inp.value=msg;}
+    if(typeof send==='function'){await send();}
+    return;
+  }
+  if(!S.session){showToast(t('no_active_session'));return;}
+  // Queue the message first (before cancel sets busy=false and drains)
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  updateQueueBadge(S.session.session_id);
+  S.pendingFiles=[];renderTray();
+  // Cancel the active stream; setBusy(false) will drain the queue
+  if(typeof cancelStream==='function'){await cancelStream();}
+  showToast(t('cmd_interrupt_confirm'),2000);
+}
+
+/**
+ * /steer <message> — Inject a steering hint mid-task without interrupting.
+ *
+ * Calls POST /api/chat/steer which looks up the cached AIAgent for this
+ * session and calls agent.steer(text). The agent's run loop appends the
+ * steer text to the next tool-result message so the model sees it on its
+ * next iteration — same pathway as the CLI's /steer command.
+ *
+ * Falls back to interrupt mode when the agent isn't running, isn't cached,
+ * or doesn't support steer (older hermes-agent versions).
+ */
+async function cmdSteer(args){
+  const msg=(args||'').trim();
+  if(!msg){showToast(t('cmd_steer_no_msg'));return;}
+  // If nothing is running, /steer <msg> just sends like a normal message
+  if(!S.busy||!S.activeStreamId){
+    const inp=$('msg');
+    if(inp){inp.value=msg;}
+    if(typeof send==='function'){await send();}
+    return;
+  }
+  if(!S.session){showToast(t('no_active_session'));return;}
+  await _trySteer(msg, /*explicitSteer=*/true);
+}
+
+/**
+ * Shared implementation for /steer and the busy_input_mode='steer' path.
+ *
+ * Tries the real steer endpoint first. On any non-accept response (no cached
+ * agent, agent lacks steer, stream dead, etc.) falls back to interrupt+queue:
+ * queues the message and cancels the stream so the drain re-sends it.
+ *
+ * @param {string} msg - The steer text.
+ * @param {boolean} explicitSteer - True if the user explicitly invoked /steer
+ *   (vs the busy-mode auto-fallback). Affects toast wording only.
+ */
+async function _trySteer(msg, explicitSteer){
+  let result=null;
+  try{
+    result=await api('/api/chat/steer',{
+      method:'POST',
+      body:JSON.stringify({session_id:S.session.session_id,text:msg}),
+    });
+  }catch(e){
+    // Network or server error — fall back to interrupt
+    result={accepted:false, fallback:'network_error'};
+  }
+  if(result&&result.accepted){
+    showToast(t('cmd_steer_delivered'),2500);
+    return;
+  }
+  // Fall back to interrupt: queue the message + cancel the stream so the
+  // drain in setBusy(false) re-sends it as a fresh turn.
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  updateQueueBadge(S.session.session_id);
+  S.pendingFiles=[];renderTray();
+  if(typeof cancelStream==='function'){await cancelStream();}
+  // Toast wording differs based on why we're falling back so the user
+  // understands what just happened.
+  const reason=(result&&result.fallback)||'unknown';
+  if(explicitSteer){
+    showToast(t('cmd_steer_fallback'),2500);
+  } else if(reason==='no_cached_agent'||reason==='not_running'||reason==='stream_dead'){
+    // Busy mode hit the steer path before the agent was ready —
+    // interrupt is the natural fallback, no need to call out steer.
+    showToast(t('busy_interrupt_confirm'),2000);
+  } else {
+    showToast(t('busy_steer_fallback'),2500);
+  }
+}
+
 async function cmdTitle(args){
   if(!S.session){showToast(t('no_active_session'));return;}
   const name=(args||'').trim();
@@ -556,7 +705,7 @@ async function cmdRetry(){
     if(r&&r.error){showToast(r.error);return;}
     if(!S.session||S.session.session_id!==activeSid)return;
     const data=await api('/api/session?session_id='+encodeURIComponent(activeSid));
-    if(data&&data.session){S.messages=data.session.messages||[];S.toolCalls=[];if(typeof clearLiveToolCards==='function')clearLiveToolCards();renderMessages();}
+    if(data&&data.session){S.messages=data.session.messages||[];S.toolCalls=[];if(typeof clearLiveToolCards==='function')clearLiveToolCards();if(typeof _messagesTruncated!=='undefined')_messagesTruncated=false;renderMessages();}
     $('msg').value=r.last_user_text||'';if(typeof autoResize==='function')autoResize();await send();
   }catch(e){showToast(t('retry_failed')+e.message);}
 }
@@ -569,16 +718,66 @@ async function cmdUndo(){
     if(r&&r.error){showToast(r.error);return;}
     if(!S.session||S.session.session_id!==activeSid)return;
     const data=await api('/api/session?session_id='+encodeURIComponent(activeSid));
-    if(data&&data.session){S.messages=data.session.messages||[];S.toolCalls=[];if(typeof clearLiveToolCards==='function')clearLiveToolCards();renderMessages();}
+    if(data&&data.session){S.messages=data.session.messages||[];S.toolCalls=[];if(typeof clearLiveToolCards==='function')clearLiveToolCards();if(typeof _messagesTruncated!=='undefined')_messagesTruncated=false;renderMessages();}
     showToast(`↩ ${t('undid_n_messages')} ${r.removed_count} ${t('undid_messages_suffix')}`);
   }catch(e){showToast(t('undo_failed')+e.message);}
+}
+async function undoLastExchange(){await cmdUndo();}
+async function cmdBtw(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const question=(args||'').trim();
+  if(!question){showToast(t('cmd_btw_usage'));return;}
+  showToast(t('btw_asking'));
+  const activeSid=S.session.session_id;
+  try{
+    const r=await api('/api/btw',{method:'POST',body:JSON.stringify({session_id:activeSid,question})});
+    if(r&&r.error){showToast(r.error);return;}
+    // Connect to the ephemeral SSE stream
+    const streamId=r.stream_id;
+    const parentSid=r.parent_session_id;
+    if(typeof attachBtwStream==='function') attachBtwStream(parentSid,streamId,question);
+  }catch(e){showToast(t('btw_failed')+e.message);}
+}
+async function cmdBackground(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const prompt=(args||'').trim();
+  if(!prompt){showToast(t('cmd_background_usage'));return;}
+  showToast(t('bg_running'));
+  const activeSid=S.session.session_id;
+  try{
+    const r=await api('/api/background',{method:'POST',body:JSON.stringify({session_id:activeSid,prompt})});
+    if(r&&r.error){showToast(r.error);return;}
+    // Show background badge and start polling
+    if(typeof showBackgroundBadge==='function') showBackgroundBadge(r.task_id);
+    if(typeof startBackgroundPolling==='function') startBackgroundPolling(activeSid,r.task_id,prompt);
+  }catch(e){showToast(t('bg_failed')+e.message);}
 }
 async function cmdStatus(){
   if(!S.session){showToast(t('no_active_session'));return;}
   try{
     const r=await api('/api/session/status?session_id='+encodeURIComponent(S.session.session_id));
     if(r&&r.error){showToast(r.error);return;}
-    S.messages.push({role:'assistant',content:[`**${t('status_heading')}**`,'',`**${t('status_session_id')}:** \`${r.session_id}\``,`**${t('status_title')}:** ${r.title||t('untitled')}`,`**${t('status_model')}:** ${r.model||t('usage_default_model')}`,`**${t('status_workspace')}:** ${r.workspace}`,`**${t('status_personality')}:** ${r.personality||t('usage_personality_none')}`,`**${t('status_messages')}:** ${r.message_count}`,`**${t('status_agent_running')}:** ${r.agent_running?t('status_yes'):t('status_no')}`,].join('\n')});
+    // Build status card lines matching CLI /status output
+    const provider=window._activeProvider||'';
+    const profile=S.activeProfile||'default';
+    const started=r.created_at?new Date(r.created_at).toLocaleString():t('status_unknown');
+    const fmtNum=n=>typeof n==='number'?n.toLocaleString():'0';
+    const tokens=r.total_tokens?`${fmtNum(r.input_tokens)} in / ${fmtNum(r.output_tokens)} out`:t('status_no_tokens');
+    const cost=r.estimated_cost?` (~$${Number(r.estimated_cost).toFixed(4)})`:'';
+    const lines=[
+      `**${t('status_heading')}**`,'',
+      `\`${r.session_id}\``,'',
+      `**${t('status_title')}:** ${r.title||t('untitled')}`,
+      `**${t('status_model')}:** ${r.model||t('usage_default_model')}${provider?'  ('+provider+')':''}`,
+      `**${t('status_profile')}:** ${profile}`,
+      `**${t('status_workspace')}:** ${r.workspace}`,
+      `**${t('status_personality')}:** ${r.personality||t('usage_personality_none')}`,
+      `**${t('status_started')}:** ${started}`,
+      `**${t('status_tokens')}:** ${tokens}${cost}`,
+      `**${t('status_messages')}:** ${r.message_count}`,
+      `**${t('status_agent_running')}:** ${r.agent_running?t('status_yes'):t('status_no')}`,
+    ];
+    S.messages.push({role:'assistant',content:lines.join('\n')});
     renderMessages();
   }catch(e){showToast(t('status_load_failed')+e.message);}
 }
@@ -622,7 +821,8 @@ function cmdReasoning(args){
     api('/api/reasoning',{method:'POST',body:JSON.stringify({effort:arg})})
       .then(function(st){
         const eff=(st && st.reasoning_effort)||arg;
-        showToast(BRAIN+' Reasoning effort set to '+eff+' (saved; applies to next turn)');
+        showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');
+        if(typeof _applyReasoningChip==='function') _applyReasoningChip(eff);
       })
       .catch(function(e){
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
@@ -637,6 +837,31 @@ function cmdVoice(){
   if(mic&&mic.style.display!=='none'&&!mic.disabled){try{mic.click();return;}catch(_){}}
   showToast(t('cmd_voice_use_mic'));
 }
+
+// ── YOLO mode toggle ──
+// Session-scoped: skips all approval prompts for the current session.
+// Toggles on/off; state is not persisted across page reloads.
+async function cmdYolo(){
+  const sid=S.session&&S.session.session_id;
+  if(!sid){showToast(t('yolo_no_session'));return;}
+  try{
+    // Check current state first to toggle
+    const status=await api('/api/session/yolo?session_id='+encodeURIComponent(sid));
+    const enable=!status.yolo_enabled;
+    await api('/api/session/yolo',{
+      method:'POST',
+      body:JSON.stringify({session_id:sid,enabled:enable}),
+    });
+    _yoloEnabled=enable;
+    _updateYoloPill();
+    showToast(enable?t('yolo_enabled'):t('yolo_disabled'));
+    if(enable){
+      // Dismiss any visible approval card
+      hideApprovalCard(true);
+    }
+  }catch(e){showToast('YOLO: '+e.message);}
+}
+
 let _skillCommandCache=[];
 let _skillCommandLoadPromise=null;
 let _skillCommandCacheReady=false;

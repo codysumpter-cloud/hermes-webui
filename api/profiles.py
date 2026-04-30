@@ -158,6 +158,89 @@ def get_hermes_home_for_profile(name: str) -> Path:
     return _DEFAULT_HERMES_HOME
 
 
+_TERMINAL_ENV_MAPPINGS = {
+    'backend': 'TERMINAL_ENV',
+    'env_type': 'TERMINAL_ENV',
+    'cwd': 'TERMINAL_CWD',
+    'timeout': 'TERMINAL_TIMEOUT',
+    'lifetime_seconds': 'TERMINAL_LIFETIME_SECONDS',
+    'modal_mode': 'TERMINAL_MODAL_MODE',
+    'docker_image': 'TERMINAL_DOCKER_IMAGE',
+    'docker_forward_env': 'TERMINAL_DOCKER_FORWARD_ENV',
+    'docker_env': 'TERMINAL_DOCKER_ENV',
+    'docker_mount_cwd_to_workspace': 'TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE',
+    'singularity_image': 'TERMINAL_SINGULARITY_IMAGE',
+    'modal_image': 'TERMINAL_MODAL_IMAGE',
+    'daytona_image': 'TERMINAL_DAYTONA_IMAGE',
+    'container_cpu': 'TERMINAL_CONTAINER_CPU',
+    'container_memory': 'TERMINAL_CONTAINER_MEMORY',
+    'container_disk': 'TERMINAL_CONTAINER_DISK',
+    'container_persistent': 'TERMINAL_CONTAINER_PERSISTENT',
+    'docker_volumes': 'TERMINAL_DOCKER_VOLUMES',
+    'persistent_shell': 'TERMINAL_PERSISTENT_SHELL',
+    'ssh_host': 'TERMINAL_SSH_HOST',
+    'ssh_user': 'TERMINAL_SSH_USER',
+    'ssh_port': 'TERMINAL_SSH_PORT',
+    'ssh_key': 'TERMINAL_SSH_KEY',
+    'ssh_persistent': 'TERMINAL_SSH_PERSISTENT',
+    'local_persistent': 'TERMINAL_LOCAL_PERSISTENT',
+}
+
+
+def _stringify_env_value(value) -> str:
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
+
+
+def get_profile_runtime_env(home: Path) -> dict[str, str]:
+    """Return env vars needed to run an agent turn for a profile home.
+
+    WebUI profile switching is per-client/cookie scoped, so it intentionally
+    does not call ``switch_profile(..., process_wide=True)`` for every browser.
+    Agent/tool code still consumes terminal backend settings through
+    environment variables (matching ``hermes -p <profile>``), so streaming must
+    apply the selected profile's terminal config and ``.env`` for the duration
+    of that run.
+    """
+    home = Path(home).expanduser()
+    env: dict[str, str] = {}
+
+    try:
+        import yaml as _yaml
+
+        cfg_path = home / 'config.yaml'
+        cfg = _yaml.safe_load(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception:
+        cfg = {}
+
+    terminal_cfg = cfg.get('terminal', {}) if isinstance(cfg, dict) else {}
+    if isinstance(terminal_cfg, dict):
+        for key, env_key in _TERMINAL_ENV_MAPPINGS.items():
+            if key in terminal_cfg and terminal_cfg[key] is not None:
+                env[env_key] = _stringify_env_value(terminal_cfg[key])
+
+    env_path = home / '.env'
+    if env_path.exists():
+        try:
+            for line in env_path.read_text(encoding='utf-8').splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and v:
+                        env[k] = v
+        except Exception:
+            logger.debug("Failed to read runtime env from %s", env_path)
+
+    return env
+
+
 def _set_hermes_home(home: Path):
     """Set HERMES_HOME env var and monkey-patch cached module-level paths."""
     os.environ['HERMES_HOME'] = str(home)
@@ -286,7 +369,6 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     # For process_wide=False (per-client switch), read the target profile's
     # config.yaml directly from disk rather than from _cfg_cache (process-global),
     # since reload_config() was intentionally skipped.
-    from api.workspace import get_last_workspace
     if process_wide:
         from api.config import get_config
         cfg = get_config()
@@ -307,11 +389,57 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     elif isinstance(model_cfg, dict):
         default_model = model_cfg.get('default')
 
+    # Read the target profile's workspace directly from *home* rather than via
+    # get_last_workspace() which routes through the thread-local/process-global active
+    # profile — both of which still point to the OLD profile during process_wide=False
+    # switches (the Set-Cookie has been sent but hasn't been processed by a new request
+    # yet).  We derive workspace in priority order:
+    #   1. {home}/webui_state/last_workspace.txt  (previously chosen workspace for this profile)
+    #   2. cfg terminal.cwd / workspace / default_workspace keys
+    #   3. Boot-time DEFAULT_WORKSPACE constant
+    # Use the module-level ``Path`` (imported at line 17) rather than re-importing
+    # it locally — keeps the exception fallback simple and avoids a latent NameError
+    # if a future refactor moves the inner imports.
+    default_workspace = None
+    try:
+        from api.config import DEFAULT_WORKSPACE as _DW
+        lw_file = home / 'webui_state' / 'last_workspace.txt'
+        if lw_file.exists():
+            _p = lw_file.read_text(encoding='utf-8').strip()
+            if _p:
+                _pp = Path(_p).expanduser()
+                if _pp.is_dir():
+                    default_workspace = str(_pp.resolve())
+        if default_workspace is None:
+            for _key in ('workspace', 'default_workspace'):
+                _v = cfg.get(_key)
+                if _v:
+                    _pp = Path(str(_v)).expanduser().resolve()
+                    if _pp.is_dir():
+                        default_workspace = str(_pp)
+                        break
+        if default_workspace is None:
+            _tc = cfg.get('terminal', {})
+            if isinstance(_tc, dict):
+                _cwd = _tc.get('cwd', '')
+                if _cwd and str(_cwd) not in ('.', ''):
+                    _pp = Path(str(_cwd)).expanduser().resolve()
+                    if _pp.is_dir():
+                        default_workspace = str(_pp)
+        if default_workspace is None:
+            default_workspace = str(_DW)
+    except Exception:
+        try:
+            from api.config import DEFAULT_WORKSPACE as _DW2
+            default_workspace = str(_DW2)
+        except Exception:
+            default_workspace = str(Path.home())
+
     return {
         'profiles': list_profiles_api(),
         'active': name,
         'default_model': default_model,
-        'default_workspace': get_last_workspace(),
+        'default_workspace': default_workspace,
     }
 
 

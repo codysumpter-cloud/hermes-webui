@@ -1,5 +1,857 @@
 # Hermes Web UI -- Changelog
 
+## [Unreleased]
+
+### Fixed
+
+## [v0.50.244] — 2026-04-30
+
+### Added
+- **Text-to-Speech playback for agent responses** — Web Speech API powers a per-message 🔊 speaker button on every assistant message, plus an optional auto-read toggle that speaks each response when streaming finishes. Voice / rate / pitch controls are exposed in Settings → Preferences. All TTS preferences are stored in `localStorage` (no server round-trip). Strips markdown, code blocks, and `MEDIA:` paths before speaking; pauses synthesis when the composer is focused. Opt-in — TTS is hidden by default until enabled in Settings. Locale coverage for en, ru, es, de, zh, zh-Hant, pt, ko. (`static/ui.js`, `static/panels.js`, `static/messages.js`, `static/boot.js`, `static/style.css`, `static/index.html`, `static/i18n.js`) @fecolinhares — PR #1303, closes #499
+- **Sienna skin (warm clay & sand earth palette)** — opt-in alongside the existing default/Ares/Mono/Slate/Poseidon/Sisyphus/Charizard set. Full palette rewrite (light + dark variants) with clay accent (`#D97757`) on a soft sand background; neutral tool-card chrome, accent-tinted active session indicator. No forced migration, default skin stays `default` (gold); users opt in via Settings → Skin. (`static/style.css`, `static/boot.js`, `static/index.html`, `tests/test_sienna_skin.py`) — PR #1307 (salvaged from #1084)
+
+### Fixed
+- **Cmd/Ctrl+K new chat works while a conversation is busy** — drops the `!S.busy` guard so users can start a new conversation mid-stream. The in-flight stream keeps running on its own session; the user just gets a fresh blank one. (`static/boot.js`, `tests/test_mobile_layout.py`) — PR #1306 (salvaged from #1084)
+- **Stale saved session 404 cleanup + structured `api()` errors** — when a saved session ID returns 404, `loadSession()` now clears `localStorage.hermes-webui-session` and rethrows so boot can fall through to the empty state instead of sticking on "Session not available in web UI." across reloads. The cleanup is gated on `!currentSid` so click-into-404 doesn't wipe state. The global `api()` helper now attaches `.status` / `.statusText` / `.body` to thrown errors, so callers can branch on HTTP status without re-parsing the message string. (`static/sessions.js`, `static/workspace.js`, `tests/test_stale_empty_session_restore.py`, `tests/test_1038_pwa_auth_redirect.py`) — PR #1304 (salvaged from #1084)
+
+## [v0.50.243] — 2026-04-30
+
+### Fixed
+- **Chip composer model badge — removed the `PRIMARY` projection** — The chip-projected configured-model badge added in #1287 was eating ≈30% of chip width (235px → 164px) without adding signal, since the model name is already right next to it. The dropdown rows still show `Primary` / `Fallback N` badges where they actually help distinguish picker entries. Backend `_build_configured_model_badges()` and the `configured_model_badges` payload on `/api/models` are preserved for the dropdown to consume. (`static/index.html`, `static/ui.js`, `static/style.css`, `tests/test_model_picker_badges.py`) — PR #1301
+- **Claude Opus 4.7 label rendering** — Adds explicit label entries for `anthropic/claude-opus-4.7`, `claude-opus-4.7`, and `claude-opus-4-7` so the picker no longer renders "Claude Opus 4 **7**" (missing dot) when the dashed-form model ID falls through to the generic dash-replace formatter. (`api/config.py`) — PR #1301
+- **Cron output snippet preserves the `## Response` section** — `/api/crons/output` returned `txt[:8000]` which could drop the useful response section when a large skill dump appeared in the prompt context. Now: if `## Response` exists, preserves a short header plus the response section; if no marker exists, returns the file tail rather than the head. (`api/routes.py`, `tests/test_sprint10.py`) @franksong2702 — PR #1297, fixes #1295
+
+## [v0.50.242] — 2026-04-30
+
+### Reverted
+- **Assistant message serif font (Georgia)** — Reverted the global `.assistant-turn .msg-body { font-family: var(--font-assistant) }` rule introduced in v0.50.240 (PR #1282). Assistant responses now render in the same system sans-serif stack as the rest of the UI, matching pre-v0.50.240 behavior. The `--font-assistant` CSS token has been removed. (`static/style.css`)
+- **Calm Console theme** — Removed the `data-theme="calm"` palette and its associated picker entry, theme-apply branch, and server-side enum value. The theme was the only consumer of the assistant serif rule and was not pulling its weight as a third theme option. Users who selected `calm` will fall back to the default theme on next page load (the server settings validator now rejects `calm` and resets to `dark`). (`static/style.css`, `static/boot.js`, `static/index.html`, `api/config.py`, `tests/test_ui_tool_call_cleanup.py`)
+
+## [v0.50.241] — 2026-04-30
+
+### Added
+- **Inline audio/video media editor with playback speed controls** — MEDIA: tokens and file attachments for audio/video now render as a full media editor card with 0.5×–2× speed buttons, rate stored in `localStorage`, and a `MutationObserver` that auto-applies the saved rate to any newly rendered player. Composer tray shows compact inline players for attached audio/video files. (`static/ui.js`, `static/boot.js`, `static/style.css`, `static/workspace.js`) @nickgiulioni1 — PR #1290 (rebased #1232)
+- **HTTP byte-range streaming for audio/video** — `/api/media?inline=1` now handles `Range:` request headers and returns HTTP 206 Partial Content, enabling seekable playback of large audio and video files. Path access is guarded by the existing `within_allowed` check before `_serve_file_bytes` is called. (`api/routes.py`) @nickgiulioni1 — PR #1290
+- **PDF and media previews in workspace file browser** — PDF, audio, and video files in the workspace panel now render inline instead of forcing download. (`static/workspace.js`) @nickgiulioni1 — PR #1290
+- **Configured model badges** — models that appear in `config.yaml` as primary or fallback are now labeled with `Primary` / `Fallback N` badges in the model picker, and the badge is carried through to the selected-model chip in the composer header. Badge data persists through the on-disk model cache so it survives server restarts. (`api/config.py`, `static/ui.js`, `static/index.html`, `static/style.css`) @renatomott — PR #1287
+- **Appearance autosave** — Theme, skin, and font-size pickers in Settings › Appearance now save immediately with inline `Saving…` / `Saved` / `Failed — Retry` status. These controls no longer set the global unsaved-changes dirty state, so closing Settings after tweaking appearance never prompts to discard. Font size is also now persisted to `config.yaml` and restored on page load. (`static/boot.js`, `static/panels.js`, `api/config.py`, `static/i18n.js`) @franksong2702 — PR #1289, refs #1003
+- **Agent session source normalization** — Imported Hermes Agent sessions now expose `raw_source`, `session_source`, and `source_label` metadata through both `/api/sessions` and gateway watcher SSE snapshots. Existing `source_tag` / `is_cli_session` compatibility fields remain unchanged so sidebar display is preserved; this lays the groundwork for source-aware sidebar policies. (`api/agent_sessions.py`, `api/gateway_watcher.py`, `api/models.py`) @franksong2702 — PR #1294, refs #1013
+
+## [v0.50.240] — 2026-04-30
+
+### Added
+- **Compact tool activity mode (`simplified_tool_calling`)** — new setting (default on) groups tool calls and thinking traces into a single collapsed "Activity" disclosure card per assistant turn instead of showing every step as a separate visible row. Keeps long agent runs readable while keeping full transparency a click away. Also adds a **Calm Console** theme (`calm`) with earth/slate palette and serif assistant prose. (`api/config.py`, `static/ui.js`, `static/panels.js`, `static/boot.js`, `static/style.css`, `DESIGN.md`) @Michaelyklam — PR #1282
+- **PDF first-page preview** — `MEDIA:` links to `.pdf` files now lazy-load a canvas preview of page 1 via PDF.js CDN (4 MB cap, download fallback). **HTML sandbox iframe** — `.html`/`.htm` files render inline in a sandboxed `<iframe srcdoc>` with `allow-scripts` only (256 KB cap). 10 new i18n keys × 7 locales. (`static/ui.js`, `static/style.css`, `static/i18n.js`) @bergeouss — PR #1280, closes #480 #482
+- **Inline Excalidraw diagram preview** — `.excalidraw` files render as a pure-SVG diagram inline (no external deps; supports rectangles, ellipses, diamonds, text, lines, arrows, freehand; 512 KB cap). (`static/ui.js`, `static/i18n.js`) @bergeouss — PR #1279, closes #479
+- **Inline CSV table rendering** — fenced `csv` blocks and `MEDIA:` CSV files render as scrollable HTML tables with auto-separator detection (comma/semicolon/tab) and quote stripping. (`static/ui.js`, `static/i18n.js`) @bergeouss — PR #1277, closes #485
+- **Inline SVG, audio, and video rendering** — SVG files render as `<img>`, audio files as `<audio controls>`, video files as `<video controls>`. File attachment previews in the composer also get inline display. (`static/ui.js`, `static/i18n.js`) @bergeouss — PR #1276, closes #481
+- **Batch session select mode** — a new select-mode toggle in the session list lets users choose multiple sessions and perform bulk Archive, Delete, or Move to Project actions. 11 new i18n keys × 7 locales. (`static/sessions.js`, `static/i18n.js`) @bergeouss — PR #1275, closes #568
+- **Collapsible skill category headers** — clicking a category header in the Skills panel collapses or expands its contents without a full re-render; collapsed state persists across filter cycles. (`static/panels.js`, `static/style.css`) @bergeouss — PR #1281
+- **`providers.only_configured` setting** — opt-in config flag that restricts the model picker to providers explicitly configured in `config.yaml`. Default false (existing behavior unchanged). (`api/config.py`) @KingBoyAndGirl — PR #1268
+- **OpenCode Go model catalog updated** — adds 7 new models: Kimi K2.6, DeepSeek V4 Pro/Flash, MiMo V2.5/Pro, Qwen3.6/3.5 Plus. (`api/config.py`) @nesquena-hermes — PR #1284, closes #1269
+
+### Fixed
+- **Profile `TERMINAL_CWD` no longer causes TypeError** — `_build_agent_thread_env()` merges all thread-local env keys into one dict before passing to `_set_thread_env()`, so a `terminal.cwd` entry in `config.yaml` can no longer conflict with the per-session workspace path. (`api/streaming.py`) @hi-friday — PR #1266
+- **Service worker no longer caches subpath API routes** — the SW cache-bypass regex now matches `/api/*` under any mount prefix (e.g. `/hermes/api/*`), fixing stale session lists when running behind a subpath reverse proxy. (`static/sw.js`) @Michaelyklam — PR #1278
+- **SSE client disconnect leaks resolved** — `TimeoutError` and `OSError` are now treated as normal disconnects; `QuietHTTPServer` suppresses them silently. Server backlog raised to 64 and handler threads daemonized. Session list renders before saved-session restore so a client-side boot error can no longer leave the sidebar empty. (`api/routes.py`, `server.py`, `static/boot.js`, `static/sessions.js`) @KayZz69 — PR #1267
+- **i18n: Korean and Chinese MCP keys corrected, missing locale keys added** — 23 Korean MCP strings that had English text replaced with correct Korean; 23 Chinese (zh) strings that had Spanish text replaced with Chinese; 41 missing keys added to zh-Hant; 229 missing keys added to de. (`static/i18n.js`) @bergeouss — PR #1274, closes #1273
+
+## [v0.50.239] — 2026-04-29
+
+### Fixed
+- **h4–h6 markdown headings now render correctly** — `renderMd()` heading replacers are now applied longest-first (`######` before `#####` before `####` before `###`…), fixing the regression where h4–h6 headings were emitted as literal `#` text. CSS adds correct font sizes and `color:var(--muted)` for h6. (`static/ui.js`, `static/style.css`) @the-own-lab — Closes #1258
+
+## [v0.50.238] — 2026-04-29
+
+### Added
+- **Portuguese (pt-BR) locale** — full i18n coverage for `pt` locale across all UI panels (chat, sessions, commands, settings, cron, workspace, profiles, skills). (`static/i18n.js`) @fecolinhares — Closes #1242
+
+### Fixed
+- **Compaction preserves visible prompts** — WebUI now keeps model-facing compacted context separately from the visible transcript, so automatic context compaction no longer replaces earlier user prompts in the scrollback. (`api/models.py`, `api/streaming.py`, `api/routes.py`) @franksong2702 — Closes #1217
+- **MiniMax China provider visible in model picker** — `MINIMAX_CN_API_KEY` now maps to the `minimax-cn` provider instead of being collapsed into global `minimax`; WebUI includes a static MiniMax (China) model catalog/display label so `providers.minimax-cn: {}` can render a populated picker group. (`api/config.py`, `api/providers.py`) @franksong2702 — Closes #1236
+- **Terminal resize and collapse controls restored** — restores the collapse/expand dock markup and controlled height CSS variable lost during the v0.50.237 batch integration, and reinstates regression coverage for terminal resizing and collapsed-state behavior. (`static/index.html`, `static/style.css`, `static/terminal.js`, `tests/test_embedded_workspace_terminal.py`) @franksong2702
+- **GET `/api/mcp/servers` returned 404** — the route was placed after `handle_get()`'s `return False` sentinel; moved inside the function before the 404 return. (`api/routes.py`) @KingBoyAndGirl — Closes #1251
+- **MCP Servers UI showed Korean labels in English locale** — 26 i18n keys in the English locale block (`en`) were accidentally set to Korean translations from PR #538; replaced with correct English text. (`static/i18n.js`) @bergeouss — Closes #1254
+- **Live model fetch for custom providers** — when `provider=custom`, the live-model endpoint now reads `model.base_url` from config and fetches `/v1/models` from the user's custom OpenAI-compat endpoint. (`api/routes.py`) @KingBoyAndGirl — Closes #1247
+- **Profile terminal env applied in WebUI sessions** — `api/terminal.py` now loads the active profile's env overlay before spawning the PTY shell. (`api/terminal.py`) @dso2ng — Closes #1245
+- **SSRF: custom provider `base_url` trusted** — `_is_ssrf_blocked()` now whitelists user-configured custom provider base URLs, preventing false SSRF blocks for legitimate private-network endpoints. (`api/routes.py`) @KingBoyAndGirl — Closes #1244
+- **SESSION_AGENT_CACHE LRU limit** — unbounded dict replaced with `functools.lru_cache` (cap 256); prevents memory growth in long-running servers with many sessions. (`api/config.py`) @happy5318 — Closes #1250
+- **Native image uploads as multimodal inputs** — image attachments uploaded to the workspace are now forwarded to vision-capable models as OpenAI-style `image_url` data-URL parts instead of text paths. Magic-byte validation rejects non-image files; workspace path validation uses `.resolve()` + `.relative_to()` (symlink-safe); 20 MiB per-image cap. (`api/streaming.py`, `api/routes.py`, `api/upload.py`, `static/ui.js`) @yzp12138 — Closes #1229
+- **`@provider:model` hint preserved when hint matches active provider** — `_resolve_compatible_session_model()` was stripping the `@provider:` prefix when the hint matched the active provider, causing duplicate model IDs from different providers to snap back to the wrong provider on the next render. The hint is now returned unchanged so `resolve_model_provider()` can route correctly. (`api/routes.py`) @nesquena-hermes — Closes #1253
+
+## [v0.50.237] — 2026-04-29
+
+### Added
+- **Embedded workspace terminal** — `/terminal` slash command opens a compact PTY-backed terminal card anchored above the composer. Supports collapse/expand/dock, resize, restart, clear, copy output, and per-session workspace binding. Env vars are allowlisted so server credentials are not exposed in the shell. (`api/terminal.py`, `static/terminal.js`, `static/commands.js`, `static/i18n.js`) @franksong2702 — Closes #1099
+- **Collapsible JSON/YAML tree viewer** — fenced `json`/`yaml` code blocks get a Tree/Raw toggle. Tree view renders collapsible, type-colored nodes (keys blue, strings green, numbers blue, booleans amber, nulls muted); auto-collapsed beyond depth 2. Default is Tree for blocks with 10+ lines. YAML parsing uses js-yaml loaded lazily via CDN with SRI. (`static/ui.js`, `static/style.css`, `static/i18n.js`) @bergeouss — Closes #484
+- **Inline diff/patch viewer** — fenced `diff`/`patch` blocks render with colored `+`/`-`/`@@` lines. `MEDIA:` links to `.patch`/`.diff` files fetch and render inline with a 50 KB cap. (`static/ui.js`, `static/style.css`, `static/i18n.js`) @bergeouss — Closes #483
+- **MCP server management UI** — Settings › System panel now lists MCP servers with transport badges, and provides add/edit/delete forms. Backend: `GET/PUT/DELETE /api/mcp/servers` with masked secrets (round-trip safe). i18n coverage across 7 locales. (`api/routes.py`, `static/panels.js`, `static/i18n.js`) @bergeouss — Closes #538
+- **Cron run status tracking and watch mode** — after "Run Now", the cron detail view shows a live spinner, running label, and elapsed timer (polls every 3 s). Auto-starts watch when opening an already-running job. `GET /api/crons/status` endpoint. Double-run guard prevents concurrent execution of the same job. (`api/routes.py`, `static/panels.js`, `static/style.css`, `static/i18n.js`) @bergeouss — Closes #526
+- **Duplicate cron job** — Duplicate button in cron detail header pre-fills the create form with the existing job settings, appends "(copy)" to the name (auto-increments on collision), and saves as paused. (`static/panels.js`, `static/i18n.js`) @bergeouss — Closes #528
+- **Upload and extract zip/tar archives into workspace** — zip, tar.gz, tgz, tar.bz2, tar.xz files are auto-extracted into a named subfolder. Zip-slip/tar-slip protection via `is_relative_to()`; zip-bomb protection via 200 MB cumulative extraction limit on actual bytes. (`api/upload.py`, `api/routes.py`, `static/ui.js`, `static/i18n.js`) @bergeouss — Closes #525
+- **Workspace directory CRUD** — right-click context menu on workspace file/dir rows adds Rename and Delete for directories. `shutil.rmtree()` guarded by `safe_resolve()` path validation. Expanded-dir cache updated on rename/delete. (`api/routes.py`, `static/ui.js`, `static/i18n.js`) @bergeouss — Closes #1104
+- **Workspace drag-to-reorder** — drag handles on workspace rows; `PUT /api/workspaces/reorder` persists new order. Reorder is confirmed (not optimistic); unmentioned workspaces are appended. (`api/routes.py`, `static/panels.js`, `static/i18n.js`) @bergeouss — Closes #492
+- **Compress affordance in context ring** — context usage tooltip shows a pre-fill button for `/compress` at ≥50% usage (hint style) and ≥75% (urgent red style). No auto-fire. (`static/ui.js`, `static/index.html`, `static/style.css`, `static/i18n.js`) @bergeouss — Closes #524
+- **DeepSeek V4, Z.AI/GLM provider, model tags** — adds `deepseek-v4-flash` and `deepseek-v4-pro`; keeps V3/R1 as `(legacy)` until 2026-07-24. Adds Z.AI/GLM provider (`glm-5.1`, `glm-5`, `glm-5-turbo`, `glm-4.7`, `glm-4.5`, `glm-4.5-flash`). Provider cards show model names; custom providers from `config.yaml` are scanned. (`api/config.py`, `api/onboarding.py`, `static/panels.js`) @jasonjcwu — Closes #1213
+- **NVIDIA NIM provider** — adds `nvidia` to the provider catalog with display name, aliases, model list, API key mapping, OpenAI-compat endpoint (`https://integrate.api.nvidia.com/v1`), and onboarding entry. (`api/config.py`, `api/providers.py`, `api/routes.py`, `api/onboarding.py`) @JinYue-GitHub — Closes #1220
+
+### Fixed
+- **Background session unread dots** — sidebar unread dots no longer depend solely on `message_count` delta. Explicit completion markers, polling fallback, INFLIGHT/S.busy sidebar spinner tracking, localStorage-persisted observed-running state, and auto-compression session-id rotation all handled. (`static/sessions.js`, `static/messages.js`) @franksong2702 — Closes #856
+- **Clarify draft preserved on timeout** — unsent clarify text is moved to the main composer when the clarify card expires or is dismissed. Countdown indicator shows remaining time; urgent styling for final seconds. (`api/clarify.py`, `static/messages.js`, `static/style.css`, `static/index.html`) @sixianli — Closes #1216
+- **Mobile busy-input composer button** — unified send/stop/queue/interrupt/steer action button so mobile users (tap-only) can queue, interrupt, or steer while the agent is busy. Dynamic icon/label/color. Removes separate cancel button path. (`static/ui.js`, `static/messages.js`, `static/sessions.js`, `static/boot.js`, `static/i18n.js`) @starship-s — Closes #1215
+- **Session sidecar repair hardened** — centralized `_apply_core_sync_or_error_marker()` helper; non-blocking lock acquire to avoid deadlock in cache-miss repair path; streaming-finally and cache-miss repair paths share logic. (`api/models.py`, `api/streaming.py`) @starship-s — Closes #1230
+- **Scroll position preserved when loading older messages** — `_loadOlderMessages` now uses `#messages` (the actual scrollable container) instead of `#msgInner`; resets `_scrollPinned` after restoring position so `scrollToBottom` does not re-fire. (`static/sessions.js`) @jasonjcwu — Closes #1219
+- **Model picker duplicate IDs across providers** — `_deduplicate_model_ids()` detects bare model IDs appearing in 2+ groups and prefixes collisions with `@provider_id:` (deterministic alphabetical tie-break). Frontend `norm()` regex strips `@provider:` prefixes for fuzzy matching. (`api/config.py`, `static/ui.js`) @bergeouss — Closes #1228
+- **`/api/models` cache metadata preserved** — disk and TTL cache now include `active_provider` and `default_model` alongside `groups`. Legacy `groups`-only cache files are rejected and rebuilt. (`api/config.py`) @franksong2702 — Closes #1239
+- **Clarify model scope copy** — composer model-selector dropdown shows "Applies to this conversation from your next message." sticky note; preferences Default Model shows "Used for new conversations." helper text. (`static/ui.js`, `static/boot.js`, `static/i18n.js`) @franksong2702 — Closes #1241
+- **Workspace panel stale after profile switch** — `loadDir('.')` called in `switchToProfile()` Case B so the file tree refreshes to the new profile. (`static/panels.js`) @bergeouss — Closes #1214
+- **OAuth providers show as unconfigured** — expanded `_OAUTH_PROVIDERS` set; live `get_auth_status()` fallback for unknown OAuth providers (gated by pid regex validation and closed `key_source` allowlist). (`api/providers.py`) @bergeouss — Closes #1212
+- **MCP delete button XSS** — replaced `onclick="...esc(s.name)..."` inline handler with `data-mcp-name` attribute + event delegation (absorb fix). (`static/panels.js`)
+- **Zip/tar-slip path traversal** — replaced `startswith` prefix check with `is_relative_to()`; zip-bomb check now tracks actual extracted bytes instead of trusting `member.file_size` (absorb fix). (`api/upload.py`)
+- **Terminal PTY env secret leak** — terminal shell env uses a safe allowlist instead of `os.environ.copy()`, preventing API keys from being visible inside the terminal (absorb fix). (`api/terminal.py`)
+- **Terminal resize handle wired** — `terminalResizeHandle` element added to `index.html`; `_terminalEls()` returns `handle` (absorb fix). (`static/index.html`, `static/terminal.js`)
+
+## [v0.50.235] — 2026-04-28
+
+### Fixed
+- **Profile switch shows correct workspace, model, and chip label immediately** — Three separate
+  bugs caused profile switching to appear broken: (1) `switch_profile(process_wide=False)` returned
+  the old profile's workspace because `get_last_workspace()` routed through thread-local profile
+  context (still pointing at the old profile during the switch); (2) the model dropdown showed stale
+  results because the in-memory models cache wasn't invalidated; (3) the profile chip stayed on the
+  old name because `syncTopbar()` returned early without updating it when no session was active.
+  (`api/profiles.py`, `api/routes.py`, `static/ui.js`,
+  `tests/test_profile_switch_1200.py`) (PR #1203)
+- **Flaky test stabilisation** — `test_server_now_ms_compensates_positive_skew` used exact-ms
+  equality across two `Date.now()` calls; fixed with midpoint averaging and ±5 ms tolerance.
+  (`tests/test_issue1144_session_time_sync.py`)
+## [v0.50.234] — 2026-04-28
+
+### Fixed
+- **XSS hardening in markdown renderer** — HTML tags in LLM output were filtered by
+  tag name only, allowing event handlers like `onerror` and `onclick` to pass through
+  on `<img>` and other elements. The sanitizer now strips all attributes except a
+  per-tag allowlist and blocks `javascript:`, `data:`, and `vbscript:` URL schemes.
+  Incomplete raw tags (`<img src=x onerror=...//` with no closing `>`) are escaped
+  before paragraph wrapping so they cannot be completed by the renderer's own output.
+  (`static/ui.js`)
+- **Delegated image lightbox** — inline `onclick` handlers on `<img class="msg-media-img">`
+  replaced with a single delegated `document.addEventListener('click')`, eliminating the
+  last source of inline event handler HTML in rendered output. (`static/ui.js`)
+- **Workspace trust for macOS symlink paths** — `/etc` on macOS resolves to `/private/etc`
+  which previously bypassed the blocked-roots check. The new `_is_blocked_workspace_path`
+  helper compares both the raw and resolved path. Also adds `/System` and `/Library` to
+  the blocked roots. (`api/workspace.py`)
+- **Legacy `/api/chat` workspace validation** — the synchronous chat fallback endpoint
+  was not routing through `resolve_trusted_workspace()`, allowing arbitrary paths to be
+  set as workspace. (`api/routes.py`)
+- **`linked_files` type guard** — skill view responses with a `null` or non-dict
+  `linked_files` field no longer crash the skills API. (`api/routes.py`)
+  (by @bschmidy10, PR #1201)
+## [v0.50.233] — 2026-04-28
+
+### Fixed
+- **Workspace trust for /var/home paths** — workspaces under `/var/home` (used by
+  systemd-homed on Fedora/RHEL) were incorrectly blocked because `_is_blocked_system_path`
+  flagged `/var` as a system root. The home-directory trust check in both
+  `resolve_trusted_workspace` and `validate_workspace_to_add` now correctly trusts any
+  path under `Path.home()` regardless of where the home directory lives on disk.
+  (`api/workspace.py`) (by @frap129, PR #1199)
+## v0.50.236 — 2026-04-28
+
+### Bug fixes
+- **fix(providers): OAuth provider cards now show "Configured" badge when token is via config.yaml** — `get_providers()` was unconditionally overwriting `has_key=True` (from `_provider_has_key()`) with `has_key=False` when `get_auth_status()` returned `logged_in=False`, discarding valid working tokens in `config.yaml`. Also: the Settings panel was filtering out all OAuth providers entirely (`filter(p=>p.configurable)` — OAuth providers always have `configurable=False`). Fixes surfaced the actionable auth error string (e.g. "refresh token consumed by Codex CLI") in the provider card body. (#1202)
+
+### Improvements
+- **ux(profiles): profile chip shows spinner and name immediately when switching** — The profile chip now gives instant visual feedback on click: the new profile name appears immediately (optimistic update), a small spinner appears on the icon, and the button is disabled to prevent double-clicks. All are cleaned up in a `finally` block so the UI never gets stuck in a loading state. On error, the chip reverts to the previous name. Additionally, the model dropdown fetch and workspace list fetch are now parallelized (`Promise.all`) instead of sequential, cutting switch time roughly in half.
+
+### Features
+- **feat: YOLO mode toggle** — `/yolo` slash command and "Skip all this session" button on approval cards. Enables session-scoped approval bypass. ⚡ amber pill in composer footer shows YOLO is active. (by @bergeouss, PR #1152, closes #467)
+## v0.50.225 — 2026-04-27
+
+### Added
+- **Cron job attention state** — recurring jobs that land in a broken state (`enabled=false`, `state=completed`, `next_run_at=null`) now show an amber "needs attention" badge instead of the misleading "off" badge. Detail panel shows a warning banner with Resume & recalculate, Run once, and Copy diagnostics actions. Korean locale translated. (`static/panels.js`, `static/style.css`, `static/i18n.js`) [#1133 @franksong2702]
+
+### Fixed
+- **Image attachments: composer tray thumbnails** — pasted/dragged images now show as 56×56 thumbnail chips in the composer instead of paperclip pills. Blob URL revoked on remove. (`static/ui.js`, `static/style.css`) [#1135]
+- **Image attachments: chat history inline** — uploaded images in sent messages now load correctly via `api/file/raw?session_id=SID&path=FILENAME` instead of the broken `api/media?path=FILENAME` path. Click any image to open a lightbox overlay (dark backdrop, 90vw/90vh, × or Escape to close). (`static/ui.js`, `static/style.css`) [#1135] Closes #1095
+- **pytest state isolation** — `conftest.py` now uses direct assignment for `HERMES_WEBUI_STATE_DIR` / `HERMES_HOME` / `HERMES_WEBUI_DEFAULT_WORKSPACE` so tests importing `api.config` in the pytest process cannot inherit the real `~/.hermes/webui` state tree. (`tests/conftest.py`) [#1136 @franksong2702]
+
+## v0.50.223 — 2026-04-26
+
+### Added
+- **Drag & drop workspace files into composer** — files and folders in the workspace file tree are now draggable; dropping them into the chat composer inserts an `@path` reference at the cursor with smart spacing. OS file drag-and-drop (attach files) still works as before. (`static/ui.js`, `static/panels.js`) [#1123 @bergeouss] Closes #1097
+- **Composer placeholder reflects active profile** — when a named profile is active (not `default`), the composer placeholder and title bar show the profile name (capitalised) instead of the global `bot_name`; falls back to `bot_name`/Hermes for the default profile. (`static/boot.js`, `static/panels.js`) [#1122 @bergeouss] Closes #1116
+
+### Fixed
+- **Copy buttons — clipboard-write Permissions-Policy** — added `clipboard-write=(self)` to the `Permissions-Policy` header so Firefox allows `navigator.clipboard.writeText()`. Extracted `_fallbackCopy()` with explicit `focus()` before `select()` and correct visible-but-hidden positioning (no more `-9999px` offscreen failure). (`api/helpers.py`, `static/ui.js`) [#1125 @bergeouss] Closes #1096
+- **Model picker shows all configured providers** — `XAI_API_KEY` and `MISTRAL_API_KEY` env vars now map to `x-ai` and `mistralai` respectively. Providers configured in `config.yaml` under `providers:` are also detected and shown in the model picker. (`api/config.py`) [#1126 @bergeouss] Partially closes #604
+- **api() retries on stale keep-alive after idle** — after a long idle period, `fetch()` throws a `TypeError` when the TCP connection has been dropped by a NAT or proxy timeout. `api()` in `workspace.js` now retries up to 3 times on `TypeError` only; 4xx/5xx HTTP errors and 401 redirects are not retried. (`static/workspace.js`) [#1121 @bergeouss] Closes #1118
+- **Google Fonts allowed in CSP** — Mermaid themes inject `@import url(fonts.googleapis.com)` at render time; the CSP `style-src` and `font-src` directives now include `fonts.googleapis.com` and `fonts.gstatic.com`. (`api/helpers.py`) [#1121 @bergeouss] Closes #1112
+
+## v0.50.221 — 2026-04-26
+
+### Fixed
+- **Custom providers model dropdown** — models dict keys in `custom_providers[].models` now all appear in the dropdown; previously only the singular `model` field was read. (`api/config.py`) [#1111 @bergeouss] Closes #1106
+- **Custom providers SSRF false positive** — hostnames from user-configured `custom_providers[].base_url` are now trusted through the SSRF check; local inference servers (llama.cpp, vLLM, TabbyAPI) no longer blocked. (`api/config.py`) [#1113 @bergeouss] Closes #1105
+- **Mobile/iPad session navigation** — tap no longer fails on first touch; replaced hover-triggered layout-shift pattern with `onpointerup` + right/middle-click filter + `touch-action:manipulation`. Desktop hover padding restored via `@media (hover:hover)` so mouse users are unaffected. (`static/sessions.js`, `static/style.css`) [#1110 @sheng-di]
+- **Pasted/dragged images render inline** — image attachments now show as `<img>` with click-to-fullscreen instead of a paperclip badge. Hoisted `_IMAGE_EXTS` to module scope (was causing `ReferenceError` in `renderMessages`); added `avif` support. (`static/ui.js`) [#1109 @bergeouss] Closes #1095
+- **Copy buttons on HTTP** — `_copyText()` helper checks `isSecureContext` and falls back to `execCommand('copy')` for plain-HTTP self-hosted installs. Silent failure in `addCopyButtons` fixed with error feedback. All 6 locales get `copy_failed` key. (`static/ui.js`, `static/i18n.js`) [#1107 @bergeouss] Closes #1096
+
+
+## v0.50.220 — 2026-04-26
+
+### Fixed
+- **Workspace panel collapse priority** — as the right panel narrows, the git badge now disappears first (below 220px), the "Workspace" label second (below 160px), and the icon buttons survive the longest. Previously `.panel-header` used `justify-content:space-between` with no flex-shrink ratios, compressing all three children simultaneously. Fix: declare `.rightpanel` as a `container-type:inline-size` container, replace `space-between` with `gap:6px` + `flex-shrink` ladder (icons=0, label=2, badge=3), and add `@container rightpanel` queries. (`static/style.css`) [#1089]
+- **Project color dot truncated/invisible on long titles** — the colored project marker on session items was appended inside `.session-title` (`overflow:hidden;text-overflow:ellipsis`), so long titles clipped the dot off entirely. Fix: move dot to a flex sibling in `.session-title-row` between title and timestamp; move `.session-time` from `position:absolute` to `margin-left:auto` in flex flow; reduce desktop rest padding-right from 86px to 8px (no longer reserving space for an absolute timestamp); mobile rest padding-right from 86px to 40px (same fix). (`static/sessions.js`, `static/style.css`) [#1089]
+## v0.50.219 — 2026-04-26
+
+### Fixed
+- **Project context menu transparent background** — the right-click menu on project chips no longer bleeds the session list through it. `_showProjectContextMenu` was using `background: var(--panel)`, but `--panel` is not defined in this codebase — CSS fell back to `transparent`. Fix: use `var(--surface)` (same opaque variable used by `.session-action-menu` and other floating popovers). (`static/sessions.js`) [#1086]
+- **Project rename / create input auto-sizing** — the rename and new-project input is no longer fixed at 100px. CSS changed to `min-width:40px; max-width:180px; width:auto`. New `_resizeProjectInput()` helper measures the current value via a hidden span (font properties read from `getComputedStyle`) and updates the pixel width as the user types. Wired into both `_startProjectRename` and `_startProjectCreate`. (`static/sessions.js`, `static/style.css`) [#1086]
+## v0.50.218 — 2026-04-26
+
+### Fixed
+- **Long URL / unbreakable string overflow** — chat bubble boundaries no longer overflow when a message contains very long URLs, file paths, or base64 data. `overflow-wrap: anywhere` added to `.msg-body` and the user-bubble variant so continuous non-whitespace text wraps at the column edge instead of bleeding into adjacent layout areas. (`static/style.css`) Closes #1080 [#1081]
+- **Project chip rename now works** — double-clicking a project chip now reliably triggers the rename input. Root cause: `onclick` was calling `renderSessionListFromCache()` which destroyed the chip DOM node before `ondblclick` could fire. Fixed with a 220ms `_clickTimer` delay on `onclick` (same pattern used by session items), so a double-click cancels the single-click and invokes rename instead. (`static/sessions.js`) Closes #1078 [#1082]
+- **Block-level constructs inside blockquotes** — fenced code blocks, headings, horizontal rules, and ordered lists inside blockquotes now render correctly; `&gt;`-entity-encoded blockquotes from LLM output also render correctly (entity decode moved before the blockquote pre-pass). New pre-pass walks lines fence-aware, strips `>` prefix, recursively renders stripped content with the full pipeline, stashes rendered HTML with `\x00Q` token. (`static/ui.js`, `static/style.css`) [#1083]
+
+### Added
+- **Project color picker** — right-clicking a project chip now shows a context menu with Rename, a row of color swatches, and Delete. Selecting a swatch updates the project color via `/api/projects/rename`. (`static/sessions.js`) Closes #1078 [#1082]
+## v0.50.217 — 2026-04-26
+
+### Fixed
+- **`/queue`, `/interrupt`, `/steer` send normally when agent is idle** — typing any of these commands while nothing is running now sends the message as a normal turn instead of showing an error toast. Matches CLI behaviour: commands are mode-sensitive (queue/interrupt/steer when busy, plain send when idle). `/stop` when idle still shows the error — stopping nothing is always an error. (`static/commands.js`) [#1076]
+
+## v0.50.216 — 2026-04-26
+
+### Added
+- **Compression chain collapse** — `get_importable_agent_sessions()` now merges linear compression continuation chains into a single sidebar entry, showing the chain tip's activity time and model. The chain root's title and start time are preserved for display; the latest importable segment is used for import. Non-compression parent/child pairs are unchanged. (`api/agent_sessions.py`, `tests/test_gateway_sync.py`) Closes #1012 [#1012 @franksong2702]
+- **Comprehensive markdown renderer improvements** — blockquote grouping, strikethrough, task lists, CRLF normalisation, nested blockquotes, lists inside blockquotes. See details below. (`static/ui.js`) [#1073]
+
+### Fixed
+- **Blockquote rendering** — consecutive `> lines` now group into one `<blockquote>`, blank `>` continuation lines become `<br>`, bare `>` (no space) handled, `>>` nested blockquotes recurse correctly, lists inside blockquotes render `<ul>`, inline markdown (bold/italic/code) works inside quotes. (`static/ui.js`) [#1073]
+- **Strikethrough** — `~~text~~` now renders as `<del>text</del>` in all contexts (paragraphs, blockquotes, list items). (`static/ui.js`) [#1073]
+- **Task lists** — `- [x]` renders as ✅, `- [ ]` renders as ☐ in all unordered list contexts including inside blockquotes. (`static/ui.js`) [#1073]
+- **CRLF line endings** — Windows `\r\n` line endings are normalised at the start of `renderMd()` so `\r` never appears in rendered text. (`static/ui.js`) [#1073]
+- **HTML/HTM preview in workspace** — `.html` and `.htm` files now render correctly in the workspace preview iframe. Root cause: `MIME_MAP` was missing these extensions; the fallback `application/octet-stream` caused browsers to refuse to render in the iframe. (`api/config.py`) [#1070]
+- **Approval card obscured by queue flyout** — the approval card's "Allow once / Allow session / Always allow / Deny" buttons are no longer hidden behind the queue flyout when both are visible simultaneously. (`static/style.css` — one line: `z-index:3` on `.approval-card.visible`) [#1071]
+- **`/steer`, `/interrupt`, `/queue` not working while agent is busy** — typing these commands while the agent is running now executes them immediately instead of queuing the raw text. Root cause: `send()` returned early inside the busy block before reaching the slash-command dispatcher. Fix: intercept the three control commands at the top of the busy block. (`static/messages.js`) [#1072]
+- **Reasoning chip always visible** — the composer reasoning chip is now shown for all effort states. When effort is unset/default it shows a muted "Default" label; when explicitly set to `none` it shows "None". Previously both states hid the chip entirely, removing the affordance to inspect or change it. (`static/ui.js`, `static/style.css`) Closes #1068 [#1074 @franksong2702]
+- **Steer settings copy updated** — removed "falls back to interrupt" / "interrupt + send" language across all 6 locales; steer mode now correctly described as "mid-turn correction without interrupting". (`static/i18n.js`, `static/index.html`) [#1072]
+
+## v0.50.215 — 2026-04-26
+
+### Added
+- **Real `/steer` command** — wires `/steer <text>` through the agent's thread-safe `agent.steer()` method rather than falling back to interrupt. Steer text is stashed in `_pending_steer` and injected into the next tool-result boundary without interrupting the current run, giving the agent a mid-turn course correction. New `/api/chat/steer` POST endpoint with five graceful fallback reasons (`no_cached_agent`, `agent_lacks_steer`, `session_not_found`, `not_running`, `stream_dead`) — any fallback transparently falls back to the existing interrupt+queue mechanism. (`api/routes.py`, `api/streaming.py`, `static/commands.js`, `static/messages.js`, `static/i18n.js`) Closes #720 follow-up [#1066 @nesquena]
+- **Steer leftover delivery** — if the agent finishes its turn before hitting a tool boundary, the stashed steer text is drained and emitted as a `pending_steer_leftover` SSE event; the frontend queues it as a next-turn message, mirroring the CLI's existing leftover path. (`api/streaming.py`, `static/messages.js`) [#1066]
+
+### Fixed
+- **Pending files preserved on steer→interrupt fallback** — the busy-mode steer path in `send()` now defers `S.pendingFiles=[]` until after `_trySteer()` returns, so staged file attachments are not lost when the steer endpoint falls back to interrupt+queue. (`static/messages.js`)
+
+## v0.50.214 — 2026-04-26
+
+### Added
+- **Busy input mode setting** — new `Settings → Preferences → Busy input mode` dropdown with three options: `Queue` (default, preserves existing behavior), `Interrupt` (cancel the current stream and re-send immediately), `Steer` (placeholder for future mid-stream injection, currently falls back to Interrupt with a toast). (`api/config.py`, `static/messages.js`, `static/boot.js`, `static/panels.js`, `static/index.html`, `static/i18n.js`) Closes #720 [#1062 @bergeouss]
+- **`/queue`, `/interrupt`, `/steer` slash commands** — per-message overrides for the busy mode regardless of the current setting. `/queue <msg>` enqueues explicitly; `/interrupt <msg>` cancels the current turn and re-sends; `/steer <msg>` same today with a future-upgrade toast. (`static/commands.js`) [#1062 @bergeouss]
+
+### Fixed
+- **`/queue` command double-bubble** — missing `noEcho:true` caused the raw slash text to be echoed as a user bubble, then the drained message appeared again as a second bubble. (`static/commands.js`)
+- **Staged-file duplication via slash commands** — `cmdQueue`, `cmdInterrupt`, and `cmdSteer` captured `S.pendingFiles` but never cleared the tray, so staged files were re-attached on the next send. Added `S.pendingFiles=[];renderTray()` after enqueue in all three handlers. (`static/commands.js`)
+
+## v0.50.213 — 2026-04-26
+
+### Fixed
+- **Models disk cache now isolated per server instance** — moved from `/dev/shm/hermes_webui_models_cache.json` (shared across all processes) to `STATE_DIR/models_cache.json`. Each server instance (port 8787 production, port 8789 QA, test runs) has its own cache file, so test/staging environments can no longer overwrite the production model list on the next restart. Also fixes macOS/Windows where `/dev/shm` doesn't exist. (`api/config.py`) [#1064]
+
+## v0.50.212 — 2026-04-26
+
+### Performance
+- **Model list ~1ms on restart** — `get_available_models()` now writes to a disk cache at `/dev/shm` on every cold rebuild and reads it back on restart, eliminating the ~30s Z.AI endpoint-probe delay on every server start. TTL raised from 60s to 24h. (`api/config.py`) [#1060 @JKJameson]
+- **Thundering-herd prevention** — RLock + `_cache_build_in_progress` flag ensures only one thread runs the cold rebuild while others wait on a Condition variable instead of triggering duplicate 10s provider calls. (`api/config.py`) [#1060 @JKJameson]
+- **Credential pool cache** — `load_pool()` results cached per provider (24h TTL) to avoid repeated expensive auth-store reads on every model list refresh. (`api/config.py`) [#1060 @JKJameson]
+
+### Fixed
+- **Stale SSE blocking** — switching sessions now discards in-flight SSE tokens from the previous session before attaching the new one; no cross-session token bleed. (`static/sessions.js`) [#1060 @JKJameson]
+- **Pending files cleared after send** — ghost attachments no longer appear in the composer tray after sending. (`static/sessions.js`) [#1060 @JKJameson]
+- **Textarea focus on session switch** — message input automatically focused after switching sessions. (`static/sessions.js`) [#1060 @JKJameson]
+- **Instant click for inactive sessions** — no loading spinner blocking fast repeated session switches. (`static/sessions.js`) [#1060 @JKJameson]
+- **Double-click titlebar to rename** — session title can be renamed by double-clicking the active session in the sidebar. (`static/sessions.js`) [#1060 @JKJameson]
+- **Draft persistence across switches** — composer draft saved/restored when switching sessions. (`static/panels.js`) [#1060 @JKJameson]
+- **user-select:none on session titles** — prevents accidental text selection on double-click. (`static/style.css`) [#1060 @JKJameson]
+- **Cache disk-delete in invalidate_models_cache()** — `invalidate_models_cache()` now also removes the on-disk snapshot so test isolation is preserved and stale cached data is never served after invalidation. (`api/config.py`)
+- **_cache_build_in_progress reset on exception** — rebuild exceptions no longer leave the flag stuck, which would block waiting threads for 60s. (`api/config.py`)
+
+## v0.50.211 — 2026-04-25
+
+### Changed
+- **Compact sidebar timestamps** — session timestamps in the left sidebar now show short labels (`1m`, `6m`, `1h`, `1d`, `1w`) instead of verbose strings like "6 minutes ago". Keeps all existing i18n paths; bucket headers (Today, Yesterday, This week) unchanged. (`static/sessions.js`, `static/i18n.js`) [#1057 @pavolbiely]
+
+### Added
+- **Adaptive session title refresh** — new opt-in setting (`Settings → Preferences → Adaptive title refresh`) re-generates the session title from the latest exchange every N turns (5, 10, or 20). Off by default. Runs in a daemon thread after stream end, never blocks the stream. Manual title renames are preserved (double-checked before and after LLM call). (`api/streaming.py`, `api/config.py`, `static/panels.js`, `static/i18n.js`, `static/index.html`) [#1058 @bergeouss]
+
+### Fixed
+- **Settings picker active state** — theme, skin, and font-size picker cards in Settings → Appearance now correctly highlight the selected option. Root cause: the base CSS rule used `!important` on `border-color`, overriding the inline style set by `_syncThemePicker()` and siblings. Fix moves to an `.active` class with its own `!important` rule. (`static/style.css`, `static/boot.js`) [#1059]
+
+## v0.50.210 — 2026-04-25
+
+### Added
+- **gpt-5.5 and gpt-5.5-mini in model picker** — available for openai, openai-codex, and copilot providers. (`api/config.py`) [#1052 @aliceisjustplaying]
+- **Login redirects back to original URL after re-login** — the iOS PWA auth redirect now passes `?next=` with the current path; `login.js` honors it via a `_safeNextPath()` helper that guards against open-redirect (rejects `//`, backslash, and non-path-absolute inputs). (`static/login.js`, `static/ui.js`, `static/workspace.js`) [#1053]
+
+### Fixed
+- **Non-standard provider first-run experience** — agent dir discovery now searches XDG_DATA_HOME, `/opt`, `/usr/local` paths; onboarding wizard auto-completes for non-wizard providers (ollama-cloud, deepseek, xai, kimi-k2.6) with `provider_configured=True`; wizard model field no longer hardcodes `gpt-5.4-mini` literal; session model resolver correctly handles unlisted active providers. (`api/config.py`, `api/onboarding.py`, `api/routes.py`) Closes #1019–#1023 [#1049]
+- **Cron session titles in sidebar** — cron-launched sessions now display the human-friendly job name (from `~/.hermes/cron/jobs.json`) instead of a generic "Cron Session" label. (`api/models.py`, `api/routes.py`) [#1050 @waldmanz]
+- **AIAgent reused per session — fixes Honcho first-turn injection** — `AIAgent` is now cached per `session_id` so the agent's turn counter increments correctly across messages. Cache is evicted on session delete/clear. (`api/config.py`, `api/routes.py`, `api/streaming.py`) Closes #1039 [#1051 @qxxaa]
+- **Mermaid Google Fonts CSP violation suppressed** — `fontFamily:'inherit'` in Mermaid themeVariables prevents `@import url('fonts.googleapis.com')` from being injected into diagram SVGs. (`static/ui.js`) Closes #1044 [#1054]
+- **bfcache layout and dropdown restore** — `pageshow+event.persisted` handler re-syncs topbar, workspace panel, session list, and gateway SSE; also closes open composer dropdowns frozen by bfcache. `_initResizePanels()` removed from pageshow (bfcache preserves listeners). (`static/boot.js`) Closes #1045 [#1055]
+
+## v0.50.209 — 2026-04-25
+
+### Added
+- **Codex-style message queue flyout** — messages typed while a stream is running now appear as a flyout card above the composer (same pattern as approval/clarify cards). Supports drag-to-reorder, inline edit, per-item model badge, Combine/Clear actions, and a collapsed pill outside the composer. Per-session DOM isolation via `_queueRenderKeys[sid]`/`_queueCollapsed[sid]` prevents cross-session bleed. Titlebar `#appTitlebarSub` chip shows live queue count. (`static/ui.js`, `static/messages.js`, `static/style.css`, `static/i18n.js`, `static/index.html`) Closes #965 [#1040 @24601]
+- **Inline HTML preview in workspace panel** — `.html` and `.htm` files now render as live sandboxed iframes (`sandbox="allow-scripts"`, no `allow-same-origin`) in the workspace file browser. A `?inline=1` parameter on `/api/file/raw` bypasses the usual attachment disposition; the server adds `Content-Security-Policy: sandbox allow-scripts` on inline HTML responses to prevent XSS when the URL is opened directly in a browser tab. (`static/workspace.js`, `api/routes.py`, `static/index.html`) Closes #779 [#1035 @bergeouss]
+- **Provider categories in setup wizard** — the onboarding provider dropdown groups 10 providers into Easy Start / Open & Self-hosted / Specialized with `<optgroup>` sections. Includes Google Gemini, DeepSeek, Mistral, and xAI/Grok with correct current model defaults. (`api/onboarding.py`, `static/onboarding.js`) Closes #603 [#1036 @bergeouss]
+
+### Fixed
+- **Manual "Check for Updates" button in System settings** — users can now trigger an update check immediately instead of waiting for the periodic background fetch. Error messages are sanitized before display. (`static/panels.js`, `static/index.html`, `static/style.css`) Closes #785 [#1033 @bergeouss]
+- **"Keep workspace panel open" toggle in Appearance settings** — adds a persistent preference so the workspace panel opens automatically on each session if preferred. The toolbar X no longer clears the preference. (`static/panels.js`, `static/boot.js`) Closes #999 [#1034 @bergeouss]
+
+### Changed
+- **CSP allowlist for Cloudflare Access deployments** — `default-src` and `manifest-src` now include `https://*.cloudflareaccess.com`, and `script-src` now includes `https://static.cloudflareinsights.com`. This unblocks Agent37-style deployments running behind Cloudflare Access without affecting vanilla self-hosters (the new origins are unreachable in non-Cloudflare environments). (`api/helpers.py`) [#1040 follow-up]
+
+## v0.50.207 — 2026-04-25
+
+### Added
+- **Live TPS stat in header** — a monospace chip in the titlebar shows tokens per second during streaming, with HIGH watermark from the past hour. Emitted via SSE at 1 Hz during active streams; hidden when idle. (`api/metering.py`, `api/streaming.py`, `static/messages.js`, `static/style.css`) [#1005 @JKJameson]
+
+### Fixed
+- **Stale SSE events no longer pollute the new session's DOM on session switch** — `appendThinking()` and `appendLiveToolCard()` now guard against events from a prior session's stream arriving after the user has switched sessions. Thinking card also auto-scrolls to top on completion so the response is immediately visible. (`static/ui.js`) [#1006 @JKJameson]
+- **Show agent sessions no longer shows empty/unimportable rows** — `state.db` can contain agent session rows before any messages are written. The sidebar now filters those out consistently across both the regular `/api/sessions` path and the gateway SSE watcher. (`api/agent_sessions.py`, `api/gateway_watcher.py`, `api/models.py`) [#1009 @franksong2702]
+- **Three orphaned i18n keys removed from language dropdown** — `cmd_status`, `memory_saved`, and `profile_delete_title` were placed outside any locale block in `static/i18n.js`, causing them to appear as invalid language options. (`static/i18n.js`) [#1010 @bergeouss]
+- **Cron panel UX polish** — Resume button SVG now uses a ▶| icon to distinguish it from Run; toast overlap fixed with `z-index` on the header; running-state badge with spinner shows during active jobs; `_cronRunningPoll` clears correctly on panel close. (`static/panels.js`, `static/index.html`, `static/style.css`, `static/i18n.js`) [#1011 @bergeouss]
+- **Create Folder and Add as Space from the browser** — users can now create directories and immediately register them as workspace spaces without SSH access; server validates paths against blocked roots before `mkdir`. (`api/routes.py`, `static/ui.js`, `static/panels.js`, `static/i18n.js`) [#1018 @bergeouss]
+- **Model-not-found errors now show a helpful message** — when a provider returns a 404 (e.g. Qwen model not available), the error is classified and a user-friendly hint appears instead of a raw HTML page. All 6 locales covered. (`api/streaming.py`, `static/messages.js`, `static/i18n.js`) [#1022 @bergeouss]
+- **Session attention indicators moved to right-side actions slot** — streaming spinners and unread dots no longer sit before the session title, avoiding title shifts. Running/unread rows hide the timestamp; idle/read rows keep right-aligned timestamps. Date group carets now point down/right correctly. Pinned group no longer repeats the star icon per row. (`static/sessions.js`, `static/style.css`) [#1024 @franksong2702]
+- **Session sidebar dates now use the last real message time** — sorting, grouping, and relative timestamps prefer `last_message_at` derived from the last non-tool message instead of metadata-only `updated_at`, so changing session settings doesn't move old conversations to Today. (`api/models.py`, `api/routes.py`) [#1024 @franksong2702]
+- **Running indicators appear immediately after send** — the sidebar now treats the active local busy session and local in-flight sessions as streaming while `/api/sessions` catches up. (`static/messages.js`, `static/sessions.js`) [#1024 @franksong2702]
+- **Large session switching and reload no longer block on cold model-catalog resolution** — `GET /api/session?messages=0` now parses only the JSON metadata prefix; metadata-only loads skip the full-session LRU cache; the frontend lazy fetch passes `resolve_model=0`; hard reload no longer waits for `populateModelDropdown()`. (`api/models.py`, `api/routes.py`, `static/boot.js`, `static/sessions.js`, `static/ui.js`) [#1025 @franksong2702]
+- **Auto title generation hardened for reasoning models** — title generation now uses a 512-token reasoning-safe budget, retries once with 1024 tokens on empty content or `finish_reason: length`, and preserves the underlying failure reason in `title_status` when falling back to a local summary. (`api/streaming.py`) [#1026 @franksong2702]
+
+## v0.50.206 — 2026-04-25
+
+### Fixed
+- **Uploaded files now resolve to their full workspace path in agent context** — drag-and-drop and paperclip file uploads were correctly saved to the workspace, but the agent received only the bare filename (e.g. `photo.jpg`) in the message context rather than an absolute path. The agent could not call `read_file` or `vision_analyze` without a full path. `uploadPendingFiles()` now returns `{name, path}` objects from the `/api/upload` response (`data.path` was always returned but never threaded through). The agent message uses the full path; all display surfaces (badges, session history, INFLIGHT state, POST body) continue showing only the bare filename. (`static/ui.js`, `static/messages.js`) Closes #996. [#997]
+
+## v0.50.205 — 2026-04-24
+
+### Fixed
+- **Workspace add: allow external paths not under home directory** — adding a workspace path such as `/mnt/d/Projects` (WSL) or any directory outside `$HOME` was blocked by a circular dependency: `resolve_trusted_workspace()` required the path to already be in the saved workspace list, but saving it required passing the same check. A new `validate_workspace_to_add()` function is now used by `/api/workspaces/add` — it only rejects non-existent paths, non-directories, and known system roots. The stricter `resolve_trusted_workspace()` continues to gate actual file read/write operations within a workspace. (`api/workspace.py`, `api/routes.py`) Closes #953. [#991]
+
+## v0.50.204 — 2026-04-24
+
+### Fixed
+- **Docker: HERMES_HOME corrected from `/root/.hermes` to `/home/hermes/.hermes`** — `docker-compose.two-container.yml` and `docker-compose.three-container.yml` both set `HERMES_HOME=/root/.hermes` and mounted the shared `hermes-home` volume to `/root/.hermes`. The `nousresearch/hermes-agent` image drops privileges to a `hermes` user (uid=10000) via `gosu`, after which `/root` is mode `700` and inaccessible — causing `mkdir: cannot create directory '/root': Permission denied` on every startup. Fixed to use `/home/hermes/.hermes` throughout. (`docker-compose.two-container.yml`, `docker-compose.three-container.yml`) Closes #967. [#989]
+
+## v0.50.203 — 2026-04-24
+
+### Fixed
+- **Queue drain race condition — drain the correct session after cross-session stream completion** — `setBusy(false)` was draining `S.session.session_id` (the *currently viewed* session) rather than the session that just finished streaming. When the user switched sessions mid-stream, queued follow-up messages for the original session were silently dropped. A new `_queueDrainSid` variable is set to `activeSid` just before calling `setBusy(false)` in all stream terminal handlers; `setBusy()` reads it once and clears it. (`static/messages.js`, `static/ui.js`, `tests/test_regressions.py`) By @24601. [#964]
+
+## v0.50.202 — 2026-04-24
+
+### Fixed
+- **Throttle inflight localStorage persist to prevent GC crash** — `saveInflightState()` was called on every token, doing `JSON.parse` + mutate + `JSON.stringify` + `localStorage.setItem` on the full inflight state map. At 60 tok/s with a 10KB messages array this produced ~36MB of JSON churn per second, the primary GC pressure source causing Chrome renderer crashes (error codes 4/5). A `_throttledPersist()` wrapper now batches writes to at most once per 2 seconds. State transitions (done/apperror/cancel/error) still flush synchronously so no more than 2s of progress is lost on a crash. (`static/messages.js`) By @24601. [#972]
+
+## v0.50.201 — 2026-04-24
+
+### Fixed
+- **Streaming render cleanup: call `clearTimeout` at all `_pendingRafHandle` sites** — PR #966's render-throttling logic uses `setTimeout(→rAF)` when within the 66ms budget window, so `_pendingRafHandle` can hold a `setTimeout` ID rather than a `requestAnimationFrame` ID. All four cleanup sites only called `cancelAnimationFrame()`, which is a no-op for `setTimeout` handles, leaving stale callbacks that could fire after stream finalization. Fixed to call both `clearTimeout()` and `cancelAnimationFrame()` (each is a no-op on the other's handle type). (`static/messages.js`) [#985]
+
+## v0.50.200 — 2026-04-24
+
+### Changed
+- **Session render cache — skip O(n) rebuild on back-navigation** — `renderMessages()` now caches rendered HTML per session (keyed by `session_id` + message count). Switching back to a previously-rendered session serves the cached DOM instantly instead of running a full markdown parse, Prism highlight, and KaTeX pass over every message. Cache is limited to 8 sessions and 300KB of rendered HTML per entry. Active streaming sessions always bypass the cache. (`static/ui.js`) By @24601. [#963]
+
+## v0.50.199 — 2026-04-24
+
+### Fixed
+- **Streaming renderer crash under GC pressure** — `_scheduleRender()` previously used `requestAnimationFrame` (up to 60fps), but each DOM update takes 50–150ms on large sessions. During GC pauses, rAF callbacks accumulated and then fired sequentially, blocking the main thread for seconds and crashing the renderer (Chrome error codes 4/5, ERR_CONNECTION_RESET). The render rate is now capped at ~15fps (66ms min interval) via a `setTimeout` → `requestAnimationFrame` chain. Stream cleanup now calls both `clearTimeout()` and `cancelAnimationFrame()` so the handle is correctly cancelled regardless of which path scheduled it. (`static/messages.js`) By @24601. [#966]
+
+## v0.50.198 — 2026-04-24
+
+### Fixed
+- **`_accepts_gzip()` hardened for test harness** — `handler.headers.get()` now uses `getattr(handler, 'headers', None)` so any synthetic handler without a `headers` attribute (including the `_FakeHandler` used in session-compress tests) no longer throws `AttributeError`. (`api/helpers.py`)
+- **Stale test assertions updated post-#959** — two static-analysis assertions in `test_issue401.py` and `test_regressions.py` referenced minified JS string patterns that PR #959 reformatted; updated to accept either form. (`tests/test_issue401.py`, `tests/test_regressions.py`) [#981]
+
+## v0.50.197 — 2026-04-24
+
+### Changed
+- **Complete Traditional Chinese (zh-Hant) translations** — adds full zh-Hant locale coverage (300+ translation entries) across all UI sections. Fixes mixed Simplified/Traditional character inconsistency in the existing zh translations. Also adds English-fallback entries to zh/ru/es/de for newly-added session management and settings keys (session_archive, session_pin, session_duplicate, settings_dropdown_*, etc.). (`static/i18n.js`) By @ruxme. [#954]
+
+## v0.50.196 — 2026-04-24
+
+### Fixed
+- **Fast conversation switching with metadata-first session load** — switching between conversations in the sidebar now does a two-phase load: phase 1 fetches only metadata (title, model, timestamps) instantly, then phase 2 lazily loads the full message history. Backend `Session.save()` reorders JSON fields so metadata appears before the messages array, enabling a 1KB prefix-read path for small sessions. JSON responses over 1KB are gzip-compressed (4x smaller for large histories). Includes `try/catch` in `_ensureMessagesLoaded` so network errors show "Failed to load" rather than a stuck "Loading conversation…" state. (`api/models.py`, `api/helpers.py`, `api/routes.py`, `static/sessions.js`) By @JKJameson. [#959]
+
+## v0.50.195 — 2026-04-24
+
+### Fixed
+- **Auth sessions now persist across server restarts** — previously `_sessions` was an in-memory dict, so every process restart (launchd, systemd, container recycle) invalidated all browser sessions and forced users to log in again. Sessions are now atomically persisted to `STATE_DIR/.sessions.json` (0600 permissions) via a temp-file + `os.replace()` write pattern. Expired sessions are pruned on load. Corrupt or missing session files start fresh without crashing. (`api/auth.py`, `tests/test_auth_session_persistence.py`) By @24601. [#962]
+
+## v0.50.194 — 2026-04-24
+
+### Fixed
+- **Prevent dropped characters in incremental streaming-markdown path** — detects parser/text prefix desync in `_smdWrite()` (which can occur after stream sanitization strips content mid-stream) and rebuilds the parser from the full current display text rather than continuing to slice from a stale offset. Adds `_smdWrittenText` tracking variable for accurate prefix-alignment checks. (`static/messages.js`) By @bsgdigital. [#960]
+
+## v0.50.193 — 2026-04-24
+
+### Fixed
+- **Strip malformed DSML `function_calls` tags from DeepSeek/Bedrock responses** — extends the existing XML tool-call stripping logic to handle DeepSeek's DSML-prefixed variants (`<｜DSML｜function_calls>`, `<｜DSML |function_calls`, and fragmented `<｜DSML |` tokens) in backend (`api/streaming.py`), live streaming (`static/messages.js`), and settled render (`static/ui.js`). Prevents raw function-call XML from leaking into message content. (`api/streaming.py`, `static/messages.js`, `static/ui.js`) By @bsgdigital. [#958]
+
+## v0.50.192 — 2026-04-24
+
+### Changed
+- **`defer` attribute added to all local script tags** — scripts already sit at the end of `<body>` so this is largely a belt-and-suspenders improvement, but `defer` makes the intent explicit and allows browsers to start parsing before the DOM is fully ready without blocking. Execution order preserved (defer is order-preserving per spec). (`static/index.html`) By @ruxme. [#951]
+
+## v0.50.191 — 2026-04-24
+
+### Fixed
+- **WebUI sessions now pass `platform='webui'` to Hermes Agent** — previously all browser-originated sessions passed `platform='cli'`, causing the agent to inject CLI-specific guidance ("avoid markdown, use plain text") that degraded WebUI output quality. Changed to `platform='webui'` in all three AIAgent call sites (`api/streaming.py`, `api/routes.py`). `'webui'` has no entry in `PLATFORM_HINTS` so no conflicting platform guidance is injected. Includes regression tests. (`api/streaming.py`, `api/routes.py`, `tests/test_webui_platform_hint.py`) By @starship-s. [#948]
+
+## v0.50.190 — 2026-04-24
+
+### Fixed
+- **`.venv` discovery in `_discover_python()`** — adds `.venv/bin/python` (Linux/macOS) and `.venv/Scripts/python.exe` (Windows) alongside the existing `venv/` paths, fixing issue #938 where setups using a `.venv` directory failed silently to locate the Hermes agent interpreter. (`api/config.py`) By @xingyue52077. Closes #938. [#949]
+
+## v0.50.189 — 2026-04-24
+
+### Fixed
+- **CSP: explicit `manifest-src 'self'` directive** — adds `manifest-src 'self'` to the `Content-Security-Policy` header. Browsers fall back to `default-src` when `manifest-src` is absent (functionally correct), but being explicit satisfies strict CSP audits and avoids browser-specific deviations. Includes regression test. (`api/helpers.py`, `tests/test_pwa_manifest_csp.py`) By @24601. [#961]
+
+## v0.50.189 — 2026-04-24
+
+### Fixed
+- **CSP: explicit `manifest-src 'self'` directive** — adds `manifest-src 'self'` to the `Content-Security-Policy` header. Browsers fall back to `default-src` when `manifest-src` is absent (functionally correct), but the explicit directive satisfies strict CSP audits and avoids any browser-specific deviation. Includes regression test. (`api/helpers.py`, `tests/test_pwa_manifest_csp.py`) By @24601. [#961]
+
+## v0.50.188 — 2026-04-24
+
+### Fixed
+- **`/btw` command: corrected SSE endpoint** — `attachBtwStream()` was connecting to `/api/stream` (which has never existed), causing every `/btw` invocation to get a 404 and produce no answer. Fixed to `/api/chat/stream`. Also aligned the `EventSource` constructor to use `URL()` + `withCredentials:true` for consistency with the rest of `static/messages.js`. (`static/messages.js`) By @bergeouss. Closes #945. [#950]
+
+## v0.50.187 — 2026-04-24
+
+### Fixed
+- **Rail/hamburger breakpoint gap closed** — at 641–767px the rail was hidden (required ≥768px) and the hamburger was also hidden (only ≤640px), leaving an awkward in-between zone. Rail breakpoint moved to ≥641px so the rail appears alongside the persistent sidebar at medium widths. Mobile slide-in behavior (hamburger toggle, overlay scrim) is unchanged at ≤640px. (`static/style.css`) [#956]
+
+## v0.50.186 — 2026-04-24
+
+### Changed
+- **Three-column layout with left rail + main-view migration** — unifies the shell into a rail (48px, desktop-only) + sidebar + main-view canvas matching the hermes-desktop reference. Every per-item detail/edit surface (skills, tasks, workspaces, profiles, memory) now lives in a dedicated `#mainX` container with consistent headers, empty states, and action buttons. Settings moves out of a modal overlay into a full main-view page (ESC closes it). YAML frontmatter renders in a collapsible `<details>` block in skill detail. Toasts repositioned to top-right with theme-aware success/error/warning/info variants. Composer workspace chip split into files-icon + label buttons. `.settings-menu` → `.side-menu` / `.side-menu-item` (shared by memory and settings panels). Mobile: hamburger in titlebar, slide-in sidebar. New i18n keys across en/ru/es/de/zh/zh-Hant for all new form labels. 9 new regression tests. (`static/index.html`, `static/style.css`, `static/panels.js`, `static/boot.js`, `static/sessions.js`, `static/ui.js`, `static/i18n.js`, `tests/test_settings_navigation_and_detail_refresh.py`) By @aronprins. [#899]
+
+## v0.50.185 — 2026-04-24
+
+### Fixed
+- **`/btw` stream handler hardened** — `_streamDone=true` now set *before* `src.close()` in `done` and `apperror` handlers (defensive ordering); `_ensureBtwRow()` in `done` gated on session match (`S.session.session_id === parentSid`) to prevent btw bubble leaking into a different session if the user switches mid-stream; `stream_end` handler also sets `_streamDone=true` for defense-in-depth. 14 new regression tests added. (`static/messages.js`, `tests/test_reasoning_chip_btw_fixes.py`) [#935]
+- **`/reasoning` toast aligned with BRAIN prefix** — success toast now reads `🧠 Reasoning effort: <level>` consistent with the command's other toasts. (`static/commands.js`) [#939]
+- **Bootstrap Python discovery finds `.venv/` layout** — `discover_launcher_python` now checks both `venv/` and `.venv/` inside the agent directory, covering installations that use a leading-dot venv layout. (`bootstrap.py`) [#941]
+
+## v0.50.184 — 2026-04-24
+
+### Fixed
+- **Reasoning chip dropdown now opens correctly** — the dropdown was placed inside `.composer-left` which has `overflow-y: hidden`, clipping the upward-opening menu entirely. Moved `#composerReasoningDropdown` outside to sit alongside the model/profile/workspace dropdowns and added `_positionReasoningDropdown()` for consistent chip-aligned positioning. Z-index raised to 200 to match other composer dropdowns. (`static/index.html`, `static/style.css`, `static/ui.js`)
+- **Reasoning chip icon is now a monochrome SVG** — replaced the `🧠` emoji in the label with a `stroke="currentColor"` brain-outline SVG matching the style of all other composer chips. (`static/index.html`, `static/ui.js`)
+- **`/reasoning <level>` now immediately updates the chip** — previously called `syncReasoningChip()` which re-applied the stale cached value. Now calls `_applyReasoningChip(eff)` directly with the server-confirmed effort level. (`static/commands.js`)
+- **`/btw` answer no longer vanishes after rendering** — `onerror` was firing when the server cleanly closed the SSE connection after `stream_end`, removing the just-rendered answer bubble. A `_streamDone` flag now prevents `onerror` from wiping the row after a successful stream. Also added `_ensureBtwRow()` call in `done` handler so the bubble renders even if no `token` events arrived. (`static/messages.js`) Closes #933.
+
+### Added
+- **Session attention indicators in the sidebar** — the session list now shows a
+  spinning indicator while a session is actively streaming (even in the
+  background), an unread dot when a session has new messages the user hasn't
+  seen, and a right-aligned relative timestamp ("2m ago", "Yesterday") next to
+  every session title. Streaming state is computed server-side from the live
+  `STREAMS` registry so it's accurate across tabs and after server restart.
+  The unread count is tracked client-side in `localStorage` and cleared
+  automatically when the active session's stream settles. Pinned-star indicator
+  moved into the title row with a fixed 10×10 box for consistent alignment.
+  Includes a 5 s polling loop that activates only while sessions are streaming,
+  and a 60 s timer to keep relative timestamps fresh. (`api/models.py`,
+  `static/sessions.js`, `static/messages.js`, `static/style.css`) Closes #856.
+  Co-authored by @franksong2702.
+
+### Fixed
+- **Nous static models now use explicit `@nous:` prefix** — the four hardcoded "(via Nous)" models (`Claude Opus 4.6`, `Claude Sonnet 4.6`, `GPT-5.4 Mini`, `Gemini 3.1 Pro Preview`) now carry `@nous:` prefix IDs, matching the format of live-fetched Nous models. Previously they used slash-only IDs that relied on the portal provider guard; the explicit prefix routes them through the same bulletproof `@provider:model` branch and eliminates 404 errors on those entries. (`api/config.py`, `tests/test_nous_portal_routing.py`)
+
+### Added
+- **Workspace path autocomplete in Spaces** — the "Add workspace path" field in
+  the Spaces panel now suggests trusted directories as you type, supports
+  keyboard navigation plus `Tab` completion, and keeps hidden directories out of
+  the list unless the current path segment starts with `.`. Suggestions are
+  limited to trusted roots (home, saved workspaces, and the boot default
+  workspace subtree) and never enumerate blocked system roots. (`api/routes.py`,
+  `api/workspace.py`, `static/panels.js`, `static/style.css`) (partial for #616)
+
+## [v0.50.232] — 2026-04-28
+
+### Fixed
+- **Model chip fuzzy-match false positive** — `_findModelInDropdown()` step-3 fuzzy fallback
+  was stripping the trailing version segment and matching via `startsWith(base) || includes(base)`,
+  causing `gpt-5.5` to resolve to `@nous:openai/gpt-5.4-mini` (both start with `gpt.5`). The fix
+  uses the full normalized target as the prefix when `base.length > 4 && base !== target`, only
+  falling back to the stripped base for bare roots (≤4 chars) where the strip was a no-op.
+  (`static/ui.js`) (#1188)
+- **openai-codex not detected in model picker** — `OPENAI_API_KEY` now also registers the
+  `openai-codex` provider group in the env-var fallback path, so users who have Codex OAuth set up
+  no longer need a manual `config.yaml` edit to see the picker entries. Note: OAuth-authenticated
+  users are already detected via `hermes_cli.auth`; this fixes the env-var-only fallback path.
+  (`api/config.py`) (#1189)
+- **Workspace files blank after second empty-session reload** — the ephemeral-session guard in
+  `boot.js` was calling `localStorage.removeItem('hermes-webui-session')`, which caused the second
+  reload to fall into the no-saved-session path that never calls `loadDir()`. Removing that line
+  keeps the session key so every reload follows the same `loadSession → loadDir` path.
+  (`static/boot.js`) (#1196)
+- **Session timestamps wrong when client and server clocks differ** — the session list's relative
+  time labels and message-footer timestamps now use a server-clock approximation (`_serverNowMs()`)
+  derived from the `server_time` field returned by `/api/sessions`. Fractional-hour timezone offsets
+  (India `+0530`, Nepal `+0545`, etc.) are handled correctly via offset-minutes arithmetic.
+  (`api/routes.py`, `static/sessions.js`) (#1144, @bergeouss)
+
+## [v0.50.231] — 2026-04-28
+
+### Fixed
+- **macOS `/etc` symlink bypass in workspace blocked-roots** — on macOS, `/etc`, `/var`, and
+  `/tmp` are symlinks to `/private/etc` etc. `_workspace_blocked_roots()` now materialises both
+  the literal and `Path.resolve()` forms of every blocked root, and a new `_is_blocked_system_path()`
+  helper applies the check with `/var/folders` and `/var/tmp` carve-outs so pytest `tmp_path_factory`
+  paths and other legitimate per-user tmp dirs remain registerable as workspaces.
+  (`api/workspace.py`, `api/routes.py`) (#1186)
+- **Workspace panel stuck closed after empty-session reload** — a regression from #1182: when a
+  user had the workspace panel open and reloaded the page on an empty/new session, the panel was
+  force-closed and the toggle disabled. `syncWorkspacePanelState()` now only force-closes in
+  `'preview'` mode (which requires a session); `'browse'` mode renders the panel chrome with a
+  no-workspace placeholder. Both boot paths restore the user's localStorage panel preference before
+  the sync call. (`static/boot.js`) (#1187)
+- **Fenced code content leaking into markdown passes** — large tool outputs with diff/patch/log
+  content (lines starting with `-`, `+`, `*`, `#` inside code blocks) were having `<ul>/<li>/<h>` tags
+  injected by the list/heading regexes, breaking `</pre>` closure and corrupting subsequent message
+  rendering. The fix keeps fenced blocks stashed as `\x00P<n>\x00` tokens through ALL markdown
+  passes and restores them AFTER lists/headings/tables, so those regexes never see the rendered HTML.
+  (`static/ui.js`) (#1154, @bergeouss)
+
+## [v0.50.230] — 2026-04-27
+
+### Fixed
+- **No disk write for empty sessions** — `new_session()` no longer eagerly writes an empty
+  JSON file to disk. The session lives in the in-memory `SESSIONS` dict only; the first disk
+  write happens at the natural "this is now a real session" moment (first user message via
+  `/api/chat/start`, or explicit `s.save()` in the btw/background-agent paths). Eliminates
+  orphan `sessions/*.json` files that accumulated on every page reload, New Conversation click,
+  or onboarding pass without sending a message. Crash-safety: if the process exits between
+  create and first message, the session is lost — since it had no messages, there is nothing
+  to lose. (`api/models.py`) (#1171 follow-up, #1184)
+
+## [v0.50.229] — 2026-04-27
+
+### Performance
+- **Session switch parallelization** — directory pre-fetches use `Promise.all()` (N×RTT → 1×RTT);
+  git status/ahead/behind run in parallel via `ThreadPoolExecutor(max_workers=3)`;
+  `loadDir()` and `highlightCode()` overlap on the idle path.
+  (`api/workspace.py`, `static/sessions.js`, `static/workspace.js`) (#1158, @jasonjcwu)
+
+### Fixed
+- **Message pagination for long conversations** — sessions with more than 30 messages load the
+  most-recent 30 on switch; older messages load on scroll-to-top or the "↑ load older" indicator.
+  Stale-response race in `_loadOlderMessages` closed; all undo/retry/compress/done paths reset
+  pagination state. (`api/routes.py`, `static/sessions.js`, `static/ui.js`, `static/commands.js`,
+  `static/i18n.js`) (#1158, @jasonjcwu)
+- **Ephemeral untitled sessions never appear in sidebar** — empty Untitled sessions are now
+  suppressed immediately rather than surfacing for 60 seconds. Both the index-path and full-scan
+  fallback filters are consistent; boot path skips restoring a zero-message session from storage.
+  (`api/models.py`, `static/boot.js`, `static/sessions.js`) (#1182)
+- **iOS Safari auto-zoom on input focus** — inputs, textareas, and selects on touch devices now
+  have a minimum `font-size: max(16px, 1em)` via `@media (hover:none) and (pointer:coarse)`,
+  preventing iOS from zooming in on focus. Accessibility-safe: user's OS font preference is
+  respected when it exceeds 16px. (`static/style.css`) (#1167, #1180)
+
+## [v0.50.229] — 2026-04-27
+
+### Performance
+- **Session switch parallelization** — directory pre-fetches now use `Promise.all()` (N×RTT → 1×RTT);
+  git status/ahead/behind subprocesses run in parallel via `ThreadPoolExecutor(max_workers=3)`;
+  `loadDir()` and `highlightCode()` run concurrently on idle path. Session switches with expanded
+  workspace dirs are measurably faster on high-latency connections.
+  (`api/workspace.py`, `static/sessions.js`, `static/workspace.js`) (#1158, @jasonjcwu)
+
+### Added
+- **Message pagination for long conversations** — sessions with more than 30 messages now load
+  the most-recent 30 on switch; older messages load on scroll-to-top or via the "↑ load older"
+  indicator at the top of the message list. All undo/retry/compression paths reset pagination
+  state correctly. (`api/routes.py`, `static/sessions.js`, `static/ui.js`, `static/commands.js`)
+  (#1158, @jasonjcwu)
+
+## [v0.50.228] — 2026-04-27
+
+### Fixed
+- **Raw `<pre>` blocks preserved in markdown renderer** — the inline `<code>` rewrite
+  pass in `renderMd()` no longer processes content inside raw `<pre>` blocks, preventing
+  multiline HTML code blocks from being degraded to backtick strings.
+  (`static/ui.js`) (#1150, @bsgdigital)
+- **Live model race silently overwrites session model** — `syncTopbar()` now skips
+  the destructive fallback-to-first-model path while a live model fetch is in flight
+  for the active provider; `_addLiveModelsToSelect()` re-applies the session model
+  once the fetch completes, so models only present in the live catalog (e.g. Kimi K2)
+  are never silently replaced. (`static/ui.js`) (#1169)
+- **Tool card output truncated at 220 chars and unscrollable** — JS truncation threshold
+  raised to 800 chars; CSS `overflow:auto` added to `.tool-card.open .tool-card-detail`
+  so the inner `<pre>` scroll works correctly; `<pre>` max-height raised to 360 px.
+  (`static/ui.js`, `static/style.css`) (#1170)
+- **New Conversation creates empty session when already on empty session** — clicking
+  the New Conversation button or pressing Cmd/Ctrl+K when the current session has zero
+  messages now focuses the composer instead of creating another empty Untitled session.
+  (`static/boot.js`) (#1171)
+- **`.env` file corruption from concurrent WebUI and CLI/Telegram writes** — removes
+  the unlocked duplicate `_write_env_file()` in `api/onboarding.py` that bypassed
+  `_ENV_LOCK`; rewrites the shared version to preserve comments, blank lines, and
+  original key order rather than rebuilding from a sorted dict.
+  (`api/onboarding.py`, `api/providers.py`) (#1164, @bergeouss)
+
+## [v0.50.227] — 2026-04-27
+
+### Fixed
+- **Korean locale label and missing Settings descriptions** — `ko._label` normalized to
+  `'한국어'`; ten Settings pane description keys that were falling back to English are
+  now fully translated. (`static/i18n.js`) (#1138)
+- **Workspace trust: alternative home roots** — `resolve_trusted_workspace()` now checks
+  the home-directory allowance before the blocked-roots loop, letting symlinked home paths
+  (e.g. `/var/home/user`) pass through correctly. (`api/workspace.py`) (#1165)
+- **Custom config-file provider models** — the provider-discovery loop now includes entries
+  defined under `providers:` in `config.yaml`, so custom providers no longer silently skip
+  the model list. Shared `_PROVIDER_MODELS` list is deep-copied before mutation to prevent
+  cross-session bleed. (`api/config.py`) (#1161)
+- **Save Settings button missing from System pane** — the System settings pane now has a
+  Save Settings button so password changes and other system fields can actually be
+  submitted. (`static/index.html`) (#1146)
+- **Per-job cron completion dot** — the Tasks panel now shows a pulsing green dot on each
+  cron job that has a new unread completion; the dot clears only when that specific job's
+  detail view is opened, not on any panel-level navigation. (`static/panels.js`,
+  `static/style.css`) (#1145)
+- **Hide cron agent sessions from sidebar by default** — sessions created by the cron
+  scheduler (source `cron` or session_id prefix `cron_`) are now filtered out of the
+  default session list in both the index path and the full-scan path; imported gateway
+  cron sessions are also hidden via `read_importable_agent_session_rows()`.
+  (`api/models.py`, `api/agent_sessions.py`) (#1143)
+- **Symlink cycle detection in workspace file browser** — intentional symlinks within the
+  workspace root are now allowed; only self-referencing or ancestor-pointing symlinks are
+  blocked. Symlink entries render with type, target, and `is_dir`. (`api/workspace.py`)
+  (#1149)
+- **`/status` command enriched** — output now includes session id, profile, model+provider,
+  workspace, personality, start time, per-turn token counts, estimated cost, and agent
+  running state. i18n keys added for all locales. (`api/session_ops.py`,
+  `static/commands.js`, `static/i18n.js`) (#1156)
+- **Per-turn cost display on assistant bubbles** — each assistant message footer now shows
+  the token delta and estimated cost for that turn, computed from the cumulative `done` SSE
+  usage minus the previous turn's total. (`static/messages.js`, `static/ui.js`) (#1159)
+- **Auto-title: skip generic fallback** — when auxiliary title generation fails and the
+  local fallback would only produce `"Conversation topic"`, the existing provisional title
+  is kept instead of persisting the generic placeholder. (`api/streaming.py`) (#1157)
+- **Sidebar session rename first-Enter revert** — double-click inline rename now keeps the
+  new title after the first Enter keypress; `finish()` is idempotent via a guard flag and
+  `_renamingSid` stays locked until the full async path (success, failure, or cancel)
+  completes. (`static/sessions.js`) (#1162)
+- **Auto-compression renders as transient card** — automatic context compression now
+  renders as a collapsible compression card instead of injecting a fake `*[Context was
+  auto-compressed]*` assistant message; preserved task-list user messages also render as
+  sub-cards. (`static/messages.js`, `static/ui.js`, `static/i18n.js`) (#1142)
+
+## [v0.50.226] — 2026-04-27
+
+### Fixed
+- **App titlebar restored to rail-era centered layout** — removes the TPS metering chip
+  from the top bar, centers the title and subtitle, and restores the message count in the
+  subtitle slot. Queue state no longer overrides the titlebar subtitle slot.
+  (`static/index.html`, `static/panels.js`, `static/style.css`, `static/ui.js`,
+  `tests/test_app_titlebar_restore.py`)
+
+## [v0.50.183] — 2026-04-24
+
+### Added
+- **`/btw` slash command** — ask an ephemeral side question using current session context without adding to history. Creates a hidden session, streams the answer in a visually distinct bubble, then discards the session. Includes `attachBtwStream()` SSE consumer and `POST /api/btw` route. (`api/routes.py`, `api/background.py`, `static/commands.js`, `static/messages.js`, `static/style.css`)
+- **`/background` slash command** — run a prompt in a parallel background agent without blocking the active conversation. Frontend polls `GET /api/background/status` for results and displays completed answers inline. Includes badge indicator in composer footer. (`api/routes.py`, `api/background.py`, `static/commands.js`, `static/messages.js`, `static/index.html`)
+- **Undo button on last assistant message** — surfaced as an ↩ icon on the last assistant message, calling the existing `/undo` command for discoverability. (`static/ui.js`)
+- **Reasoning effort chip in composer** — visual chip to set reasoning effort level from the composer footer without typing a command. (`static/ui.js`, `static/index.html`, `static/style.css`)
+
+### Fixed
+- **Background task completion hook wired** — `complete_background()` was never called after a background agent finished, so tasks stayed in `status="running"` forever and polling always returned `[]`. Fixed by wrapping `_run_agent_streaming` in `_run_bg_and_notify` which extracts the last assistant message and signals the tracker. Also fixed `get_results()` to retain in-flight tasks during polls so concurrent tasks are not dropped. (`api/background.py`, `api/routes.py`, `tests/test_background_tasks.py`)
+- **Ephemeral sessions correctly skip persistence** — added `return` after the ephemeral `done` event in `_run_agent_streaming()`, preventing ephemeral session state from being written to disk after stream completion. (`api/streaming.py`)
+
+Co-authored by @bergeouss.
+
+## [v0.50.181] — 2026-04-24
+
+### Changed
+- **Vendor streaming-markdown@0.2.15** — self-hosts the incremental markdown parser instead of loading it from jsDelivr CDN. The library (12.6 KB) is committed to `static/vendor/smd.min.js` so the app works fully offline / air-gapped, and the exact bytes are pinned in version control. SHA-384 hash preserved in an HTML comment for manual audit. (`static/vendor/smd.min.js`, `static/index.html`) Co-authored by @bsgdigital.
+
+## [v0.50.180] — 2026-04-23
+
+### Added
+- **Incremental streaming markdown via `streaming-markdown`** — replaces the per-animation-frame full `innerHTML` re-render with an incremental DOM-building parser. During streaming, only new character deltas are fed to the parser per frame (`_smdWrite()`), eliminating DOM thrashing and improving rendering smoothness. Prism.js / KaTeX state no longer gets reset mid-stream. Falls back to the existing `renderMd()` path when the library is unavailable. (`static/messages.js`, `static/index.html`) Co-authored by @bsgdigital.
+
+## [v0.50.179] — 2026-04-23
+
+### Fixed
+- **Onboarding wizard clobbering CLI users' config after server restart** — CLI-configured users (who set up via `hermes model` / `hermes auth`) had no `onboarding_completed` flag in `settings.json`. After a git branch switch or server restart, `verify_hermes_imports()` could momentarily return `imports_ok=False`, making `chat_ready=False` and causing the wizard to reappear with a destructive dropdown default (openrouter). Fixed by writing `onboarding_completed: True` to `settings.json` the first time `config_auto_completed` evaluates to `True`, so the flag survives future transient import failures. (`api/onboarding.py`) Co-authored by @bsgdigital.
+
+## [v0.50.177] — 2026-04-23
+
+### Fixed
+- **Settings dialog and message controls unusable on mobile** — three mobile usability fixes: (1) settings tab strip replaced by a native `<select>` dropdown on narrow viewports, panel goes full-width; (2) provider card Save/Remove buttons become icon-only on mobile so the API key input fills the available width; (3) message timestamps, copy, and edit buttons are always visible on touch screens (no hover state on mobile). (`static/index.html`, `static/panels.js`, `static/style.css`) Co-authored by @bsgdigital.
+## [v0.50.178] — 2026-04-23
+
+### Added
+- **PWA support — installable as a standalone app** — adds a Web App Manifest (`manifest.json`) and a minimal service worker (`sw.js`) with cache-first strategy for app shell assets and network-bypass for all `/api/*` and `/stream` endpoints. Cache name auto-busts on every deploy via git-derived version injection. Enables "Add to Home Screen" on Android, iOS, and desktop Chrome without any offline API response caching (live backend always required). (`static/manifest.json`, `static/sw.js`, `static/index.html`, `api/routes.py`) Closes #685. Co-authored by @bsgdigital.
+
+## [v0.50.176] — 2026-04-23
+
+### Fixed
+- **Duplicate model dropdown entries when CLI default matches live-fetched model** — `_addLiveModelsToSelect()` now normalises IDs before the dedup check (strips `@provider:` prefix using `indexOf`+`substring` to preserve multi-colon Ollama tag suffixes like `qwen3-vl:235b-instruct`, strips namespace prefix, unifies separators). (`static/ui.js`) Closes #907.
+- **New Chat uses stale default model after saving Preferences without reload** — `window._defaultModel` is now updated in `_applySavedSettingsUi()` so `newSession()` picks up the newly saved default immediately. (`static/panels.js`) Closes #908.
+- **Injected CLI default model shows raw lowercase label** — new `_get_label_for_model()` helper looks up the model's formatted label from existing catalog groups before falling back to title-casing the bare ID. (`api/config.py`) Closes #909.
+
+## [v0.50.175] — 2026-04-23
+
+### Fixed
+- **Session persistence hardened against concurrent write races** — all session-mutation paths (streaming success/error/cancel, periodic checkpoint, HTTP endpoints for title/personality/workspace/clear/pin/archive/project) now hold a per-session `_agent_lock` during in-memory mutation and `Session.save()`. The checkpoint thread is stopped and joined before the final save, preventing stale object clobbers. `Session.save()` uses fsync + atomic rename with a pid+thread_id tmp suffix. `_write_session_index()` gets a dedicated `_INDEX_WRITE_LOCK` so disk I/O runs outside the global `LOCK`, reducing head-of-line blocking. Context compression now runs the LLM call outside the lock with a stale-edit check (409) on write-back. (`api/streaming.py`, `api/models.py`, `api/routes.py`, `api/session_ops.py`, `api/config.py`) Closes #765. Co-authored by @starship-s.
+
+## [v0.50.174] — 2026-04-23
+
+### Fixed
+- **Interleaved streaming order (Text → Thinking → Tool → Text)** — after a tool call completes, new text tokens now create a new DOM segment below the tool card instead of updating the old segment above it. Adds `segmentStart`/`_freshSegment` flags to track segment boundaries; scopes the streaming cursor to the last live assistant segment only; adds a 3-dot waiting indicator below each tool card; fixes `appendLiveToolCard`/`appendThinking` anchor logic for multi-tool sequences. (`static/messages.js`, `static/ui.js`, `static/style.css`) Co-authored by @bsgdigital.
+
+## [v0.50.173] — 2026-04-23
+
+### Fixed
+- **Ordered list items always showed "1." regardless of position** — when LLMs
+  output numbered lists with blank lines between items, the paragraph-splitter
+  in `renderMd()` placed each item in its own `<ol>` container, causing every
+  `<ol>` to restart at 1. Fixed by emitting `value="N"` on each `<li>` so the
+  correct ordinal is preserved even when items are split across multiple `<ol>`
+  wrappers. (`static/ui.js`) Closes #886. Co-authored by @bsgdigital.
+
+## [v0.50.172] — 2026-04-23
+
+### Fixed
+- **Stop Generation preserves partial streamed content** — clicking Stop Generation previously discarded all text the agent had produced, showing only "*Task cancelled.*". The server now accumulates streamed tokens in a per-stream buffer and persists any partial assistant content to the session when a cancel fires. Thinking/reasoning blocks (`<think>...</think>`, including unclosed tags — the common cancel-mid-reasoning case) are stripped before saving. The partial content is flagged `_partial: true` and kept in conversation history so the model can continue from it on the next user message. (`api/config.py`, `api/streaming.py`) Closes #893.
+
+## [v0.50.171] — 2026-04-23
+
+### Fixed
+- **Nous default model picker shows correct selection and saves no longer freeze** — two bugs for Nous/portal provider users: (1) Settings → Preferences → Default Model picker showed blank after saving because `set_hermes_default_model()` wrote a bare resolved form that didn't match the `@nous:...` option values in the dropdown; fixed by using `_applyModelToDropdown()`'s smart normalising matcher to find the right option without requiring an exact string match. (2) Every Settings save triggered a blocking live-fetch from the provider API (~5 s freeze) because `set_hermes_default_model()` called `get_available_models()` before returning; the function now returns a lightweight `{ok, model}` ack and invalidates the TTL cache instead. Config.yaml always stores the CLI-compatible bare/slash form (e.g. `anthropic/claude-opus-4.6`) so CLI users on the same install are unaffected. (`api/config.py`, `static/panels.js`) Closes #895.
+- **Cross-namespace models (minimax/, qwen/) no longer 404 for Nous users** — `resolve_model_provider()` checked the `config_base_url` branch before the portal-provider guard. Nous always has a `base_url` in config, so known cross-namespace prefixes were stripped before reaching the portal check. Portal providers are now checked first so all slash-prefixed model IDs reach Nous intact. (`api/config.py`) Closes #894.
+
+## [v0.50.170] — 2026-04-23
+
+### Fixed
+- **Settings default model picker shows live-fetched models** — the Settings → Preferences → Default Model dropdown previously only showed static models from `_PROVIDER_MODELS`. It now calls `_fetchLiveModels()` via the new `_addLiveModelsToSelect()` helper, consistent with the chat-header dropdown. New sessions also respect the saved default model (`window._defaultModel`) instead of always reading the chat-header value, which reflected the previous session's model. (`static/ui.js`, `static/sessions.js`, `static/panels.js`) Closes #872. Co-authored by @bergeouss.
+
+## [v0.50.163] — 2026-04-23
+
+### Fixed
+- **Message ordering after task cancellation** — cancelling a stream while the
+  agent is responding no longer causes subsequent responses to appear above the
+  "Task cancelled." marker. The cancel handler now fetches the authoritative
+  message list from the server (same as the done event), and the server persists
+  the cancel message to the session so both paths stay in sync. Falls back to
+  the previous local-push behaviour if the API call fails. (`api/streaming.py`,
+  `static/messages.js`) (@mittyok, #882)
+
+## [v0.50.161] — 2026-04-23
+
+### Fixed
+- **CI: `test_set_key_writes_to_env_file` no longer flaky in full-suite ordering** — two test files (`test_profile_env_isolation.py`, `test_profile_path_security.py`) were calling `sys.modules.pop("api.profiles")` without restoring the module reference, permanently removing `api.profiles` from the module cache and corrupting state for subsequent tests. Replaced with `monkeypatch.delitem(sys.modules, ...)` so the module reference is restored automatically after each test. (`tests/test_profile_env_isolation.py`, `tests/test_profile_path_security.py`)
+- **`api/providers.py` `_write_env_file()` lock and mode fixes** — moved file I/O (mkdir + write) inside the `_ENV_LOCK` block to prevent TOCTOU race between concurrent key-save requests; replaced `write_text()` with `os.open(..., O_CREAT, 0o600)` so new `.env` files are created owner-read/write-only from the first byte. (`api/providers.py`)
+
+## [v0.50.160] — 2026-04-23
+
+### Fixed
+- **CI: provider panel i18n keys now present in all 6 locales** — `es`, `de`, `zh`, `ru`, `zh-Hant` were missing the 19 provider panel keys added in v0.50.159, causing locale parity test failures on CI after every push to master. (`static/i18n.js`)
+
+## [v0.50.159] — 2026-04-23
+
+### Added
+- **Provider key management in Settings** — new "Providers" tab lets users add, update, or remove API keys for direct-API providers without editing `.env` files. Covers Anthropic, OpenAI, Google, DeepSeek, xAI, Mistral, MiniMax, Z.AI, Kimi, Ollama, Ollama Cloud, OpenCode Zen/Go. OAuth providers shown as read-only. Keys stored in `~/.hermes/.env`, take effect immediately. Fully localised (6 locales). (`api/providers.py`, `api/routes.py`, `static/panels.js`, `static/i18n.js`) (PR #867 by @bergeouss, closes #586)
+
+### Security
+- Provider write endpoints require auth or local/private-network client (matching onboarding endpoint gate)
+- `.env` created at 0600 from first byte via `os.open`; pre-existing files tightened to 0600 on every write
+- Full `_ENV_LOCK` coverage across load/modify/write — prevents TOCTOU race between concurrent POSTs
+
+## [v0.50.158] — 2026-04-23
+
+### Fixed
+- **Post-update page reload no longer races against server restart** — `applyUpdates()` and `forceUpdate()` now poll `/health` every 500ms (up to 15 seconds) instead of firing a blind 2500ms `setTimeout`. The existing reconnect banner shows "⏳ Restarting… please wait" during the poll window, giving users a visible status and a manual Reload button. If the server is still down after 15s, the banner message changes to prompt a manual reload. Fixes 502 errors seen when the server restart outpaces the fixed delay, especially behind reverse proxies. (`static/ui.js`) (closes #874)
+
+## [v0.50.157] — 2026-04-22
+
+### Fixed
+- **Nous portal models now route and format correctly** — two bugs fixed: (1) `_PROVIDER_MODELS["nous"]` updated from bare IDs (`claude-opus-4.6`) to slash-prefixed format (`anthropic/claude-opus-4.6`) that the Nous portal API expects. (2) `resolve_model_provider()` now routes cross-namespace models through portal providers (Nous, OpenCode Zen, OpenCode Go) directly instead of mis-routing to OpenRouter. Portal guard returns the full slash-preserved model ID so Nous receives the correct format. 10 regression tests. (`api/config.py`) (closes #854)
+
+## [v0.50.156] — 2026-04-22
+
+### Security
+- **⚠️ Breaking change — auto-install of agent dependencies is now opt-in** — users previously relying on auto-install must now set `HERMES_WEBUI_AUTO_INSTALL=1` to restore the previous behaviour. A new `_trusted_agent_dir()` check validates ownership and permission bits before allowing pip to run. (`api/startup.py`, `README.md`) (addresses #842 by @tomaioo)
+
+## [v0.50.155] — 2026-04-22
+
+### Fixed
+- **Honcho per-session memory uses stable session ID across WebUI turns** — `api/streaming.py` now passes `gateway_session_key=session_id` to `AIAgent` (defensive, same pattern as `api_mode`/`credential_pool`). Without this, Honcho's `per-session` strategy created a new Honcho session on each streaming request. (`api/streaming.py`) (closes #855)
+
+## [v0.50.154] — 2026-04-22
+
+### Fixed
+- **Thinking card no longer mirrors main response** — removed early return in `_streamDisplay()` that bypassed think-block stripping when `reasoningText` was populated. (`static/messages.js`) (closes #852)
+
+## [v0.50.153] — 2026-04-22
+
+### Fixed
+- **Live-fetched portal models route through configured provider** — `_fetchLiveModels()` applies `@provider:` prefix. (closes #854)
+
+## [v0.50.152] — 2026-04-22
+
+### Fixed
+- **Image generation renders inline** — `MEDIA:` token restore renders all `https://` URLs as `<img>`. (closes #853)
+- **Auto-title strips thinking preambles** — `_strip_thinking_markup()` strips Qwen3-style plain-text reasoning preambles. (closes #857)
+
+## [v0.50.151] — 2026-04-22
+
+### Added
+- **Ollama Cloud support** — added `ollama-cloud` display name + dynamic model-list
+  handler backed by `hermes_cli.models.provider_model_ids()`. Live-models endpoint
+  routes `ollama-cloud` through the same formatter. Server-side `_format_ollama_label()`
+  and matching client-side `_fmtOllamaLabel()` turn Ollama tag IDs into readable
+  labels (e.g. `qwen3-vl:235b-instruct` → `Qwen3 VL (235B Instruct)`). (#820 by @starship-s, #860)
+
+### Fixed
+- **`credential_pool` providers now visible in the model dropdown** —
+  `get_available_models()` previously only read `active_provider` from the auth
+  store. Providers added via `credential_pool` (e.g. an Ollama Cloud key stored by
+  the auth layer without a matching shell env var) were silently invisible. The
+  fix loads `credential_pool` entries and adds any provider with at least one
+  non-ambient credential to `detected_providers`. Ambient gh-cli tokens (source
+  `gh_cli` / label `gh auth token`) are explicitly excluded so Copilot doesn't
+  appear merely because `gh` is installed. Two-tier detection: primary via
+  `agent.credential_pool.load_pool()`, fallback via raw field inspection when
+  the upstream module isn't importable. (#820 by @starship-s, #860)
+- **`_apply_provider_prefix()` helper extracted** — removes ~15 lines of
+  duplicated inline `@provider:` prefixing logic for non-active providers.
+  Semantics unchanged; one fewer place for drift. (#860)
+- **Model chip shows friendly labels for bare Ollama IDs** —
+  `static/ui.js:getModelLabel()` now routes Ollama tag-format IDs (e.g.
+  `kimi-k2.6` or `@ollama-cloud:glm5.1`) through `_fmtOllamaLabel()`. Custom
+  `<option>` text uses the same helper. `looksLikeBareOllamaId` narrowed to
+  `@ollama*` or colon-tag patterns — does not reformat generic IDs like
+  `gpt-5.4-mini`. `syncModelChip()` is now called after localStorage restore
+  so the chip reflects the saved selection on first paint. (#860)
+
 ## [v0.50.150] — 2026-04-22
 
 ### Fixed

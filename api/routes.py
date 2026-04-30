@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -17,12 +18,115 @@ from urllib.parse import parse_qs
 
 logger = logging.getLogger(__name__)
 
+# Treat stalled/closed HTTP clients as normal disconnects.  Long-lived SSE
+# connections often end this way when a browser tab sleeps, a phone switches
+# networks, or Tailscale leaves the socket half-closed.  If these bubble to the
+# request handler, the server logs 500s and can leave CLOSE-WAIT sockets around
+# until the OS-level timeout fires.
+_CLIENT_DISCONNECT_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+    OSError,
+)
+
+# ── Cron run tracking ────────────────────────────────────────────────────────
+# Track job IDs currently being executed so the frontend can poll status.
+_RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
+_RUNNING_CRON_LOCK = threading.Lock()
+_CRON_OUTPUT_CONTENT_LIMIT = 8000
+_CRON_OUTPUT_HEADER_CONTEXT = 200
+
+
+def _mark_cron_running(job_id: str):
+    with _RUNNING_CRON_LOCK:
+        _RUNNING_CRON_JOBS[job_id] = time.time()
+
+
+def _mark_cron_done(job_id: str):
+    with _RUNNING_CRON_LOCK:
+        _RUNNING_CRON_JOBS.pop(job_id, None)
+
+
+def _is_cron_running(job_id: str) -> tuple[bool, float]:
+    """Return (is_running, elapsed_seconds)."""
+    with _RUNNING_CRON_LOCK:
+        t = _RUNNING_CRON_JOBS.get(job_id)
+        if t is None:
+            return False, 0.0
+        return True, time.time() - t
+
+
+def _cron_response_marker_index(text: str) -> int:
+    """Return the start index of a markdown Response heading, if present."""
+    candidates = []
+    for heading in ("## Response", "# Response"):
+        if text.startswith(heading):
+            candidates.append(0)
+        idx = text.find(f"\n{heading}")
+        if idx >= 0:
+            candidates.append(idx + 1)
+    return min(candidates) if candidates else -1
+
+
+def _cron_output_content_window(text: str, limit: int = _CRON_OUTPUT_CONTENT_LIMIT) -> str:
+    """Return a bounded cron output window that preserves useful response text.
+
+    Cron output files can contain large skill dumps in the Prompt section. The
+    UI already extracts ``## Response`` when present, so keep that section in
+    the API payload instead of blindly returning the first ``limit`` chars.
+    """
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    response_idx = _cron_response_marker_index(text)
+    if response_idx >= 0:
+        header = text[:min(_CRON_OUTPUT_HEADER_CONTEXT, response_idx)].rstrip()
+        response = text[response_idx:].lstrip("\n")
+        content = f"{header}\n...\n{response}" if header else response
+        return content[:limit]
+
+    return text[-limit:]
+
+
+def _run_cron_tracked(job):
+    """Wrapper that tracks running state around cron.scheduler.run_job."""
+    try:
+        run_job(job)
+    finally:
+        _mark_cron_done(job.get("id", ""))
+
 _PROVIDER_ALIASES = {
     "claude": "anthropic",
     "gpt": "openai",
     "gemini": "google",
     "openai-codex": "openai",
 }
+
+# OpenAI-compatible /v1/models endpoints for live model discovery.
+# Used as fallback when hermes_cli.provider_model_ids() is unavailable or
+# returns [] for a provider (#871).  Kept at module level so the dict is
+# built once, not reconstructed per request.
+_OPENAI_COMPAT_ENDPOINTS = {
+    "zai": "https://api.z.ai/v1",
+    "minimax": "https://api.minimax.chat/v1",
+    "mistralai": "https://api.mistral.ai/v1",
+    "xai": "https://api.x.ai/v1",
+    "deepseek": "https://api.deepseek.com",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "nvidia": "https://integrate.api.nvidia.com/v1",
+}
+# NOTE: "openai-codex" is excluded because it maps to the same endpoint as
+# the base "openai" provider (api.openai.com/v1).  When both are configured
+# the openai provider is already wired through provider_model_ids(); codex-
+# specific model filtering happens downstream in hermes_cli.
+#
+# TODO: Add TTL-based caching (e.g. 60s) so repeated model-list requests
+# don't hit provider APIs.  The frontend already caches via _liveModelCache
+# but the backend re-fetches on every /api/models/live call.
 
 from api.config import (
     STATE_DIR,
@@ -45,6 +149,9 @@ from api.config import (
     MAX_FILE_BYTES,
     MAX_UPLOAD_BYTES,
     CHAT_LOCK,
+    _get_session_agent_lock,
+    SESSION_AGENT_LOCKS,
+    SESSION_AGENT_LOCKS_LOCK,
     load_settings,
     save_settings,
     set_hermes_default_model,
@@ -192,6 +299,44 @@ def _normalize_provider_id(value: str | None) -> str:
     return "" 
 
 
+def _catalog_provider_id_sets(catalog: dict) -> tuple[set[str], set[str]]:
+    raw_provider_ids: set[str] = set()
+    normalized_provider_ids: set[str] = set()
+    for group in catalog.get("groups") or []:
+        raw = str(group.get("provider_id") or "").strip().lower()
+        if not raw:
+            continue
+        raw_provider_ids.add(raw)
+        normalized = _normalize_provider_id(raw)
+        if normalized:
+            normalized_provider_ids.add(normalized)
+    return raw_provider_ids, normalized_provider_ids
+
+
+def _catalog_has_provider(
+    provider_raw: str,
+    provider_normalized: str,
+    raw_provider_ids: set[str],
+    normalized_provider_ids: set[str],
+) -> bool:
+    return (
+        provider_raw in raw_provider_ids
+        or (provider_normalized and provider_normalized in raw_provider_ids)
+        or (provider_normalized and provider_normalized in normalized_provider_ids)
+    )
+
+
+def _model_matches_active_provider_family(
+    model: str,
+    active_provider: str,
+) -> bool:
+    model_lower = model.lower()
+    for bare_prefix in ("gpt", "claude", "gemini"):
+        if model_lower.startswith(bare_prefix):
+            return _normalize_provider_id(bare_prefix) == active_provider
+    return False
+
+
 def _resolve_compatible_session_model(model_id: str | None) -> tuple[str, bool]:
     """Return (effective_model, was_normalized) for persisted session models.
 
@@ -208,7 +353,51 @@ def _resolve_compatible_session_model(model_id: str | None) -> tuple[str, bool]:
         return default_model, bool(default_model)
 
     active_provider = _normalize_provider_id(catalog.get("active_provider"))
-    if not active_provider:
+    # Also keep the raw active_provider slug for cross-provider detection with
+    # non-listed providers (ollama-cloud, deepseek, xai, etc.) that _normalize_provider_id
+    # returns "" for. If the raw provider is set but normalization returned "", we still
+    # want to detect that a session model from a known provider (e.g. openai/gpt-5.4-mini)
+    # is stale relative to this unknown active provider. (#1023)
+    raw_active_provider = str(catalog.get("active_provider") or "").strip().lower()
+    if not active_provider and not raw_active_provider:
+        return model, False
+
+    if model.startswith("@") and ":" in model:
+        provider_hint, bare_model = model[1:].split(":", 1)
+        provider_raw = provider_hint.strip().lower()
+        provider_normalized = _normalize_provider_id(provider_raw)
+        bare_model = bare_model.strip()
+        if not provider_raw or not bare_model:
+            return model, False
+
+        raw_provider_ids, normalized_provider_ids = _catalog_provider_id_sets(catalog)
+        hint_matches_active = (
+            provider_raw == raw_active_provider
+            or provider_raw == active_provider
+            or (provider_normalized and provider_normalized == active_provider)
+        )
+        if hint_matches_active:
+            # The @provider:model hint explicitly names the active provider, so this
+            # selection is intentional — not a stale cross-provider artifact. Return
+            # the full @provider:model string unchanged so downstream (resolve_model_provider
+            # in config.py) can route through the correct provider. Stripping the prefix
+            # here would collapse duplicate model IDs from different providers back to the
+            # bare ID, causing the first matching provider to win on the next UI render
+            # and the wrong provider to be used for the agent run. (#1253)
+            return model, False
+
+        if _catalog_has_provider(
+            provider_raw,
+            provider_normalized,
+            raw_provider_ids,
+            normalized_provider_ids,
+        ):
+            return model, False
+
+        if _model_matches_active_provider_family(bare_model, active_provider):
+            return bare_model, True
+        if default_model:
+            return default_model, True
         return model, False
 
     slash = model.find("/")
@@ -251,7 +440,12 @@ def _resolve_compatible_session_model(model_id: str | None) -> tuple[str, bool]:
 
     # Skip normalization for models on custom/openrouter namespaces — these are
     # user-controlled and should never be silently replaced.
-    if model_provider and model_provider not in {"", "custom", "openrouter"} and model_provider != active_provider and default_model:
+    # Also normalize when the model is from a known provider but the active provider
+    # is an unlisted one (e.g. ollama-cloud) — active_provider is "" in that case
+    # but raw_active_provider is set. If model_provider doesn't start with the raw
+    # active provider name, the session model is stale. (#1023)
+    _active_for_compare = active_provider or raw_active_provider
+    if model_provider and model_provider not in {"", "custom", "openrouter"} and model_provider != _active_for_compare and default_model:
         return default_model, True
     return model, False
 
@@ -300,12 +494,17 @@ from api.workspace import (
     get_last_workspace,
     set_last_workspace,
     list_dir,
+    list_workspace_suggestions,
     read_file_content,
     safe_resolve_ws,
     resolve_trusted_workspace,
+    validate_workspace_to_add,
+    _is_blocked_system_path,
+    _workspace_blocked_roots,
 )
-from api.upload import handle_upload, handle_transcribe
+from api.upload import handle_upload, handle_upload_extract, handle_transcribe
 from api.streaming import _sse, _run_agent_streaming, cancel_stream
+from api.providers import get_providers, set_provider_key, remove_provider_key
 from api.onboarding import (
     apply_onboarding_setup,
     get_onboarding_status,
@@ -324,6 +523,9 @@ try:
         _lock,
         _permanent_approved,
         resolve_gateway_approval,
+        enable_session_yolo,
+        disable_session_yolo,
+        is_session_yolo_enabled,
     )
 except ImportError:
     _submit_pending_raw = lambda *a, **k: None
@@ -332,6 +534,9 @@ except ImportError:
     save_permanent_allowlist = lambda *a, **k: None
     is_approved = lambda *a, **k: True
     resolve_gateway_approval = lambda *a, **k: 0
+    enable_session_yolo = lambda *a, **k: None
+    disable_session_yolo = lambda *a, **k: None
+    is_session_yolo_enabled = lambda *a, **k: False
     _pending = {}
     _lock = threading.Lock()
     _permanent_approved = set()
@@ -550,6 +755,41 @@ def handle_get(handler, parsed) -> bool:
             logged_in = bool(cv and verify_session(cv))
         return j(handler, {"auth_enabled": is_auth_enabled(), "logged_in": logged_in})
 
+    if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
+        static_root = Path(__file__).parent.parent / "static"
+        manifest_path = (static_root / "manifest.json").resolve()
+        if manifest_path.exists():
+            data = manifest_path.read_bytes()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/manifest+json; charset=utf-8")
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+            return True
+        return j(handler, {"error": "not found"}, status=404)
+
+    if parsed.path == "/sw.js":
+        static_root = Path(__file__).parent.parent / "static"
+        sw_path = (static_root / "sw.js").resolve()
+        if sw_path.exists():
+            # Inject the current git-derived version as the cache name so the
+            # service worker cache busts automatically on every new deploy.
+            from api.updates import WEBUI_VERSION
+            text = sw_path.read_text(encoding="utf-8").replace(
+                "__CACHE_VERSION__", WEBUI_VERSION
+            )
+            data = text.encode("utf-8")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/javascript; charset=utf-8")
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Service-Worker-Allowed", "/")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+            return True
+        return j(handler, {"error": "not found"}, status=404)
+
     if parsed.path == "/favicon.ico":
         static_root = Path(__file__).parent.parent / "static"
         ico_path = (static_root / "favicon.ico").resolve()
@@ -585,6 +825,10 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/models/live":
         return _handle_live_models(handler, parsed)
 
+    # ── Providers (GET) ──
+    if parsed.path == "/api/providers":
+        return j(handler, get_providers())
+
     if parsed.path == "/api/settings":
         settings = load_settings()
         # Never expose the stored password hash to clients
@@ -611,23 +855,103 @@ def handle_get(handler, parsed) -> bool:
         return _serve_static(handler, parsed)
 
     if parsed.path == "/api/session":
-        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        import time as _time
+        _t0 = _time.monotonic()
+        _debug_slow = os.environ.get("HERMES_DEBUG_SLOW", "")
+        query = parse_qs(parsed.query)
+        sid = query.get("session_id", [""])[0]
         if not sid:
             return j(handler, {"error": "session_id is required"}, status=400)
+        # ?messages=0 skips the message payload for fast session switching.
+        # The frontend uses this when switching conversations in the sidebar
+        # (only needs metadata). The full message array is loaded lazily
+        # via ?messages=1 when the message panel opens.
+        load_messages = query.get("messages", ["1"])[0] != "0"
+        resolve_model_default = "1" if load_messages else "0"
+        resolve_model = query.get("resolve_model", [resolve_model_default])[0] != "0"
+        # ?msg_limit=N returns only the last N messages (tail window).
+        # Used by the frontend for fast session switching — avoids serialising
+        # and sending hundreds of messages when the user only sees the most
+        # recent exchange.  Older messages are loaded on-demand via scrolling.
+        _msg_limit = query.get("msg_limit", [None])[0]
         try:
-            s = get_session(sid)
-            effective_model = _resolve_effective_session_model_for_display(s)
+            msg_limit = max(1, int(_msg_limit)) if _msg_limit else None
+        except (ValueError, TypeError):
+            msg_limit = None
+        # ?msg_before=N — 0-based index into the full message array.
+        # Returns messages before this index (for scroll-to-top lazy loading).
+        # Combined with msg_limit for paging.
+        _msg_before = query.get("msg_before", [None])[0]
+        try:
+            msg_before = int(_msg_before) if _msg_before else None
+        except (ValueError, TypeError):
+            msg_before = None
+        try:
+            _t1 = _time.monotonic()
+            s = get_session(sid, metadata_only=(not load_messages))
+            _t2 = _time.monotonic()
+            effective_model = (
+                _resolve_effective_session_model_for_display(s)
+                if resolve_model
+                else None
+            )
+            _t3 = _time.monotonic()
+            _all_msgs = s.messages if load_messages else []
+            if load_messages:
+                if msg_before is not None:
+                    # Scroll-to-top paging: msg_before is a 0-based index into
+                    # the full message list. Return the msg_limit messages that
+                    # appear *before* this index (i.e. older messages).
+                    # Using index instead of timestamp avoids issues with
+                    # duplicate/missing timestamps.
+                    _before_idx = max(0, min(int(msg_before), len(_all_msgs)))
+                    _slice = _all_msgs[:_before_idx]
+                    _truncated_msgs = _slice[-msg_limit:] if msg_limit else _slice
+                elif msg_limit and len(_all_msgs) > msg_limit:
+                    _truncated_msgs = _all_msgs[-msg_limit:]
+                else:
+                    _truncated_msgs = _all_msgs
+            else:
+                _truncated_msgs = _all_msgs
             raw = s.compact() | {
-                "messages": s.messages,
-                "tool_calls": getattr(s, "tool_calls", []),
+                "messages": _truncated_msgs,
+                "tool_calls": getattr(s, "tool_calls", []) if load_messages else [],
                 "active_stream_id": getattr(s, "active_stream_id", None),
                 "pending_user_message": getattr(s, "pending_user_message", None),
-                "pending_attachments": getattr(s, "pending_attachments", []),
+                "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
             }
+            # Signal to the frontend that older messages were omitted.
+            # For msg_before paging, compare against the filtered set,
+            # not the full list — otherwise we signal truncation even when
+            # all older messages were returned.
+            if msg_before is not None:
+                _truncated = load_messages and msg_limit is not None and len(_slice) > msg_limit
+            else:
+                _truncated = load_messages and msg_limit is not None and len(_all_msgs) > msg_limit
+            raw["_messages_truncated"] = _truncated
+            # Index of the first returned message in the full message array.
+            # Frontend uses this as cursor for scroll-to-top paging.
+            if msg_before is not None:
+                raw["_messages_offset"] = max(0, _before_idx - len(_truncated_msgs))
+            else:
+                raw["_messages_offset"] = max(0, len(_all_msgs) - len(_truncated_msgs))
+            _t4 = _time.monotonic()
             if effective_model:
                 raw["model"] = effective_model
-            return j(handler, {"session": redact_session_data(raw)})
+            redact = redact_session_data(raw)
+            _t5 = _time.monotonic()
+            resp = j(handler, {"session": redact})
+            _t6 = _time.monotonic()
+            if _debug_slow:
+                logger.warning(
+                    "[SLOW] session_id=%s get_session=%.1fms model_resolve=%.1fms "
+                    "compact=%.1fms redact=%.1fms json_write=%.1fms total=%.1fms",
+                    sid,
+                    (_t2-_t1)*1000, (_t3-_t2)*1000, (_t4-_t3)*1000,
+                    (_t5-_t4)*1000, (_t6-_t5)*1000, (_t6-_t0)*1000,
+                )
+            return resp
         except KeyError:
             # Not a WebUI session -- try CLI store
             msgs = get_cli_session_messages(sid)
@@ -645,6 +969,8 @@ def handle_get(handler, parsed) -> bool:
                     "message_count": len(msgs),
                     "created_at": (cli_meta or {}).get("created_at", 0),
                     "updated_at": (cli_meta or {}).get("updated_at", 0),
+                    "last_message_at": (cli_meta or {}).get("last_message_at")
+                    or (cli_meta or {}).get("updated_at", 0),
                     "pinned": False,
                     "archived": False,
                     "project_id": None,
@@ -666,6 +992,12 @@ def handle_get(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
 
+    if parsed.path == "/api/session/yolo":
+        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        if not sid:
+            return bad(handler, "Missing session_id")
+        return j(handler, {"yolo_enabled": is_session_yolo_enabled(sid)})
+
     if parsed.path == "/api/session/usage":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
         if not sid:
@@ -676,24 +1008,42 @@ def handle_get(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
 
+    if parsed.path == "/api/background/status":
+        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        if not sid:
+            return bad(handler, "Missing session_id")
+        from api.background import get_results
+        return j(handler, {"results": get_results(sid)})
+
     if parsed.path == "/api/sessions":
         webui_sessions = all_sessions()
         settings = load_settings()
         if settings.get("show_cli_sessions"):
             cli = get_cli_sessions()
             webui_ids = {s["session_id"] for s in webui_sessions}
-            deduped_cli = [s for s in cli if s["session_id"] not in webui_ids]
+            from api.models import _hide_from_default_sidebar as _cron_hide
+            deduped_cli = [s for s in cli
+                           if s["session_id"] not in webui_ids
+                           and not _cron_hide(s)]
         else:
             deduped_cli = []
         merged = webui_sessions + deduped_cli
-        merged.sort(key=lambda s: s.get("updated_at", 0) or 0, reverse=True)
+        merged.sort(
+            key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
+            reverse=True,
+        )
         safe_merged = []
         for s in merged:
             item = dict(s)
             if isinstance(item.get("title"), str):
                 item["title"] = _redact_text(item["title"])
             safe_merged.append(item)
-        return j(handler, {"sessions": safe_merged, "cli_count": len(deduped_cli)})
+        return j(handler, {
+            "sessions": safe_merged,
+            "cli_count": len(deduped_cli),
+            "server_time": time.time(),
+            "server_tz": time.strftime("%z"),
+        })
 
     if parsed.path == "/api/projects":
         return j(handler, {"projects": load_projects()})
@@ -704,6 +1054,17 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/workspaces":
         return j(
             handler, {"workspaces": load_workspaces(), "last": get_last_workspace()}
+        )
+
+    if parsed.path == "/api/workspaces/suggest":
+        qs = parse_qs(parsed.query)
+        prefix = qs.get("prefix", [""])[0]
+        return j(
+            handler,
+            {
+                "suggestions": list_workspace_suggestions(prefix),
+                "prefix": prefix,
+            },
         )
 
     if parsed.path == "/api/sessions/search":
@@ -801,6 +1162,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/chat/stream":
         return _handle_sse_stream(handler, parsed)
 
+    if parsed.path == "/api/terminal/output":
+        return _handle_terminal_output(handler, parsed)
+
     if parsed.path == '/api/sessions/gateway/stream':
         return _handle_gateway_sse_stream(handler, parsed)
 
@@ -842,6 +1206,9 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/crons/recent":
         return _handle_cron_recent(handler, parsed)
+
+    if parsed.path == "/api/crons/status":
+        return _handle_cron_status(handler, parsed)
 
     # ── Skills API (GET) ──
     if parsed.path == "/api/skills":
@@ -885,7 +1252,7 @@ def handle_get(handler, parsed) -> bool:
             )
         raw = _skill_view(name)
         data = json.loads(raw) if isinstance(raw, str) else raw
-        if "linked_files" not in data:
+        if not isinstance(data.get("linked_files"), dict):
             data["linked_files"] = {}
         return j(handler, data)
 
@@ -910,6 +1277,10 @@ def handle_get(handler, parsed) -> bool:
             {"name": get_active_profile_name(), "path": str(get_active_hermes_home())},
         )
 
+    # ── MCP Servers (GET) ──
+    if parsed.path == "/api/mcp/servers":
+        return _handle_mcp_servers_list(handler)
+
     return False  # 404
 
 
@@ -924,6 +1295,8 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/upload":
         return handle_upload(handler)
+    if parsed.path == "/api/upload/extract":
+        return handle_upload_extract(handler)
 
     if parsed.path == "/api/transcribe":
         return handle_transcribe(handler)
@@ -947,6 +1320,28 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e))
         except RuntimeError as e:
             return bad(handler, str(e), 500)
+
+    # ── Providers (POST) ──
+    if parsed.path == "/api/providers":
+        provider_id = (body.get("provider") or "").strip().lower()
+        api_key = body.get("api_key")
+        if not provider_id:
+            return bad(handler, "provider is required")
+        if api_key is not None:
+            api_key = str(api_key).strip() or None
+        result = set_provider_key(provider_id, api_key)
+        if not result.get("ok"):
+            return bad(handler, result.get("error", "Unknown error"))
+        return j(handler, result)
+
+    if parsed.path == "/api/providers/delete":
+        provider_id = (body.get("provider") or "").strip().lower()
+        if not provider_id:
+            return bad(handler, "provider is required")
+        result = remove_provider_key(provider_id)
+        if not result.get("ok"):
+            return bad(handler, result.get("error", "Unknown error"))
+        return j(handler, result)
 
     if parsed.path == "/api/reasoning":
         # CLI-parity /reasoning handler — writes to the same config.yaml keys
@@ -974,6 +1369,19 @@ def handle_post(handler, parsed) -> bool:
         except RuntimeError as e:
             return bad(handler, str(e), 500)
 
+    if parsed.path == "/api/admin/reload":
+        # Hot-reload api.models module to pick up code changes without restart.
+        import importlib
+        from api import models as _models
+        importlib.reload(_models)
+        # Also re-expose get_session from the reloaded module so routes.py
+        # continues to work (routes.py imported it at module level).
+        import api.routes as _routes
+        _routes.get_session = _models.get_session
+        _routes.Session = _models.Session
+        _routes.compact = _models.compact
+        return j(handler, {"status": "ok", "reloaded": "api.models"})
+
     if parsed.path == "/api/sessions/cleanup":
         return _handle_sessions_cleanup(handler, body, zero_only=False)
 
@@ -989,8 +1397,9 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        s.title = str(body["title"]).strip()[:80] or "Untitled"
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.title = str(body["title"]).strip()[:80] or "Untitled"
+            s.save()
         return j(handler, {"session": s.compact()})
 
     if parsed.path == "/api/personality/set":
@@ -1033,8 +1442,9 @@ def handle_post(handler, parsed) -> bool:
                 prompt = "\n".join(p for p in parts if p)
             else:
                 prompt = str(value)
-        s.personality = name if name else None
-        s.save()
+        with _get_session_agent_lock(sid):
+            s.personality = name if name else None
+            s.save()
         return j(handler, {"ok": True, "personality": s.personality, "prompt": prompt})
 
     if parsed.path == "/api/session/update":
@@ -1046,13 +1456,21 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
+        old_ws = getattr(s, "workspace", "")
         try:
             new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace)))
         except ValueError as e:
             return bad(handler, str(e))
-        s.workspace = new_ws
-        s.model = body.get("model", s.model)
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.workspace = new_ws
+            s.model = body.get("model", s.model)
+            s.save()
+        if str(old_ws or "") != str(new_ws or ""):
+            try:
+                from api.terminal import close_terminal
+                close_terminal(body["session_id"])
+            except Exception:
+                logger.debug("Failed to close workspace terminal after workspace update")
         set_last_workspace(new_ws)
         return j(handler, {"session": s.compact() | {"messages": s.messages}})
 
@@ -1065,6 +1483,9 @@ def handle_post(handler, parsed) -> bool:
         # Delete from WebUI session store
         with LOCK:
             SESSIONS.pop(sid, None)
+        # Evict cached agent so turn count doesn't leak into a recycled session
+        from api.config import _evict_session_agent
+        _evict_session_agent(sid)
         try:
             p = (SESSION_DIR / f"{sid}.json").resolve()
             p.relative_to(SESSION_DIR.resolve())
@@ -1074,10 +1495,19 @@ def handle_post(handler, parsed) -> bool:
             p.unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to unlink session file %s", p)
+        # Prune the per-session agent lock so deleted sessions don't leak
+        # Lock entries in SESSION_AGENT_LOCKS forever.
+        with SESSION_AGENT_LOCKS_LOCK:
+            SESSION_AGENT_LOCKS.pop(sid, None)
         try:
             SESSION_INDEX_FILE.unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to unlink session index")
+        try:
+            from api.terminal import close_terminal
+            close_terminal(sid)
+        except Exception:
+            logger.debug("Failed to close workspace terminal for deleted session %s", sid)
         # Also delete from CLI state.db (for CLI sessions shown in sidebar)
         try:
             from api.models import delete_cli_session
@@ -1096,10 +1526,14 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        s.messages = []
-        s.tool_calls = []
-        s.title = "Untitled"
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.messages = []
+            s.tool_calls = []
+            s.title = "Untitled"
+            s.save()
+            # Evict cached agent — cleared session is a fresh conversation
+            from api.config import _evict_session_agent
+            _evict_session_agent(body["session_id"])
         return j(handler, {"ok": True, "session": s.compact()})
 
     if parsed.path == "/api/session/truncate":
@@ -1114,8 +1548,9 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         keep = int(body["keep_count"])
-        s.messages = s.messages[:keep]
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.messages = s.messages[:keep]
+            s.save()
         return j(
             handler, {"ok": True, "session": s.compact() | {"messages": s.messages}}
         )
@@ -1151,11 +1586,63 @@ def handle_post(handler, parsed) -> bool:
         except ValueError as e:
             return j(handler, {"error": str(e)})
 
+    # ── YOLO mode toggle (POST) ──
+    # Session-scoped only — stored in-memory on the server side.
+    # Important lifecycle notes:
+    #   • Page reload: state PERSISTS (frontend re-fetches via GET endpoint)
+    #   • Cross-tab: state is SHARED (same server-side flag per session)
+    #   • Server restart: state is LOST (in-memory only)
+    #   • Cross-session: isolated (each session has its own flag)
+    # Fixes #467
+    if parsed.path == "/api/session/yolo":
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        sid = body["session_id"]
+        enabled = bool(body.get("enabled", True))
+        if enabled:
+            enable_session_yolo(sid)
+            # Also resolve any pending approvals for this session so the
+            # agent doesn't stay stuck waiting on an already-dismissed card.
+            try:
+                from tools.approval import _pending as _p, _lock as _l
+                with _l:
+                    _p.pop(sid, None)
+            except Exception:
+                pass
+            resolve_gateway_approval(sid, "once", resolve_all=True)
+        else:
+            disable_session_yolo(sid)
+        return j(handler, {"ok": True, "yolo_enabled": enabled})
+
+    if parsed.path == "/api/btw":
+        return _handle_btw(handler, body)
+
+    if parsed.path == "/api/background":
+        return _handle_background(handler, body)
+
     if parsed.path == "/api/chat/start":
         return _handle_chat_start(handler, body)
 
     if parsed.path == "/api/chat":
         return _handle_chat_sync(handler, body)
+
+    if parsed.path == "/api/chat/steer":
+        from api.streaming import _handle_chat_steer
+        return _handle_chat_steer(handler, body)
+
+    if parsed.path == "/api/terminal/start":
+        return _handle_terminal_start(handler, body)
+
+    if parsed.path == "/api/terminal/input":
+        return _handle_terminal_input(handler, body)
+
+    if parsed.path == "/api/terminal/resize":
+        return _handle_terminal_resize(handler, body)
+
+    if parsed.path == "/api/terminal/close":
+        return _handle_terminal_close(handler, body)
 
     # ── Cron API (POST) ──
     if parsed.path == "/api/crons/create":
@@ -1202,6 +1689,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/workspaces/rename":
         return _handle_workspace_rename(handler, body)
 
+    if parsed.path == "/api/workspaces/reorder":
+        return _handle_workspace_reorder(handler, body)
+
     # ── Approval (POST) ──
     if parsed.path == "/api/approval/respond":
         return _handle_approval_respond(handler, body)
@@ -1234,6 +1724,11 @@ def handle_post(handler, parsed) -> bool:
             # process_wide=False: don't mutate the process-global _active_profile.
             # Per-client profile is managed via cookie + thread-local (#798).
             result = switch_profile(name, process_wide=False)
+            # Invalidate the models cache so the very next /api/models request
+            # rebuilds from the new profile's config.yaml rather than returning
+            # the old profile's cached model list (#1200 — profile-switch model bug).
+            from api.config import invalidate_models_cache
+            invalidate_models_cache()
             return j(handler, result, extra_headers={
                 'Set-Cookie': build_profile_cookie(name),
             })
@@ -1388,8 +1883,9 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        s.pinned = bool(body.get("pinned", True))
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.pinned = bool(body.get("pinned", True))
+            s.save()
         return j(handler, {"ok": True, "session": s.compact()})
 
     # ── Session archive (POST) ──
@@ -1402,8 +1898,9 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        s.archived = bool(body.get("archived", True))
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.archived = bool(body.get("archived", True))
+            s.save()
         return j(handler, {"ok": True, "session": s.compact()})
 
     # ── Session move to project (POST) ──
@@ -1416,8 +1913,9 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
-        s.project_id = body.get("project_id") or None
-        s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            s.project_id = body.get("project_id") or None
+            s.save()
         return j(handler, {"ok": True, "session": s.compact()})
 
     # ── Project CRUD (POST) ──
@@ -1739,7 +2237,127 @@ def _handle_sse_stream(handler, parsed):
             _sse(handler, event, data)
             if event in ("stream_end", "error", "cancel"):
                 break
-    except (BrokenPipeError, ConnectionResetError):
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    return True
+
+
+def _terminal_session_and_workspace(body_or_query):
+    sid = str(body_or_query.get("session_id", "")).strip()
+    if not sid:
+        raise ValueError("session_id required")
+    try:
+        s = get_session(sid)
+    except KeyError:
+        raise KeyError("Session not found")
+    workspace = resolve_trusted_workspace(getattr(s, "workspace", "") or "")
+    return sid, workspace
+
+
+def _handle_terminal_start(handler, body):
+    try:
+        sid, workspace = _terminal_session_and_workspace(body)
+        from api.terminal import start_terminal
+        term = start_terminal(
+            sid,
+            workspace,
+            rows=int(body.get("rows") or 24),
+            cols=int(body.get("cols") or 80),
+            restart=bool(body.get("restart")),
+        )
+        return j(
+            handler,
+            {
+                "ok": True,
+                "session_id": sid,
+                "workspace": term.workspace,
+                "running": term.is_alive(),
+            },
+        )
+    except KeyError as e:
+        return bad(handler, str(e), 404)
+    except ValueError as e:
+        return bad(handler, str(e), 400)
+    except Exception as e:
+        return bad(handler, _sanitize_error(e), 500)
+
+
+def _handle_terminal_input(handler, body):
+    try:
+        require(body, "session_id")
+        data = str(body.get("data", ""))
+        if len(data) > 8192:
+            return bad(handler, "input too large", 413)
+        from api.terminal import write_terminal
+        write_terminal(body["session_id"], data)
+        return j(handler, {"ok": True})
+    except KeyError as e:
+        return bad(handler, str(e), 404)
+    except ValueError as e:
+        return bad(handler, str(e), 400)
+    except Exception as e:
+        return bad(handler, _sanitize_error(e), 500)
+
+
+def _handle_terminal_resize(handler, body):
+    try:
+        require(body, "session_id")
+        from api.terminal import resize_terminal
+        resize_terminal(
+            body["session_id"],
+            rows=int(body.get("rows") or 24),
+            cols=int(body.get("cols") or 80),
+        )
+        return j(handler, {"ok": True})
+    except KeyError as e:
+        return bad(handler, str(e), 404)
+    except ValueError as e:
+        return bad(handler, str(e), 400)
+    except Exception as e:
+        return bad(handler, _sanitize_error(e), 500)
+
+
+def _handle_terminal_close(handler, body):
+    try:
+        require(body, "session_id")
+        from api.terminal import close_terminal
+        closed = close_terminal(body["session_id"])
+        return j(handler, {"ok": True, "closed": closed})
+    except ValueError as e:
+        return bad(handler, str(e), 400)
+
+
+def _handle_terminal_output(handler, parsed):
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    if not sid:
+        return bad(handler, "session_id required")
+    from api.terminal import get_terminal
+    term = get_terminal(sid)
+    if term is None:
+        return j(handler, {"error": "terminal not running"}, status=404)
+
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "keep-alive")
+    handler.end_headers()
+    try:
+        while True:
+            try:
+                event, data = term.output.get(timeout=25)
+            except queue.Empty:
+                handler.wfile.write(b": terminal heartbeat\n\n")
+                handler.wfile.flush()
+                if term.closed.is_set() and term.output.empty():
+                    _sse(handler, "terminal_closed", {"exit_code": term.proc.poll()})
+                    break
+                continue
+            _sse(handler, event, data)
+            if event in ("terminal_closed", "terminal_error"):
+                break
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         pass
     return True
 
@@ -1821,7 +2439,7 @@ def _handle_gateway_sse_stream(handler, parsed):
             if event_data is None:
                 break  # watcher is stopping
             _sse(handler, event_data.get('type', 'sessions_changed'), event_data)
-    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+    except _CLIENT_DISCONNECT_ERRORS:
         pass
     finally:
         watcher.unsubscribe(q)
@@ -1849,6 +2467,84 @@ def _content_disposition_value(disposition: str, filename: str) -> str:
         f'{disposition}; filename="{ascii_fallback}"; '
         f"filename*=UTF-8''{quoted_name}"
     )
+
+
+def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse a single HTTP bytes range into inclusive start/end offsets."""
+    if not range_header or not range_header.startswith("bytes=") or file_size < 1:
+        return None
+    spec = range_header.split("=", 1)[1].strip()
+    if "," in spec or "-" not in spec:
+        return None
+    start_s, end_s = spec.split("-", 1)
+    try:
+        if start_s == "":
+            # suffix range: bytes=-500
+            suffix_len = int(end_s)
+            if suffix_len <= 0:
+                return None
+            start = max(0, file_size - suffix_len)
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+            if start < 0:
+                return None
+            end = min(end, file_size - 1)
+        if start > end or start >= file_size:
+            return None
+        return start, end
+    except ValueError:
+        return None
+
+
+def _serve_file_bytes(handler, target: Path, mime: str, disposition: str, cache_control: str, *, csp: str | None = None):
+    """Serve a file with correct MIME/disposition and optional byte-range support."""
+    try:
+        file_size = target.stat().st_size
+    except PermissionError:
+        return bad(handler, "Permission denied", 403)
+    except Exception:
+        return bad(handler, "Could not stat file", 500)
+
+    byte_range = _parse_range_header(handler.headers.get("Range", ""), file_size)
+    if handler.headers.get("Range") and byte_range is None:
+        handler.send_response(416)
+        handler.send_header("Content-Range", f"bytes */{file_size}")
+        handler.send_header("Accept-Ranges", "bytes")
+        _security_headers(handler)
+        handler.end_headers()
+        return True
+
+    start, end = byte_range if byte_range else (0, max(0, file_size - 1))
+    content_length = end - start + 1 if file_size else 0
+    handler.send_response(206 if byte_range else 200)
+    handler.send_header("Content-Type", mime)
+    handler.send_header("Content-Length", str(content_length))
+    handler.send_header("Accept-Ranges", "bytes")
+    if byte_range:
+        handler.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+    handler.send_header("Cache-Control", cache_control)
+    handler.send_header("Content-Disposition", _content_disposition_value(disposition, target.name))
+    if csp:
+        handler.send_header("Content-Security-Policy", csp)
+    _security_headers(handler)
+    handler.end_headers()
+
+    if content_length:
+        try:
+            with target.open("rb") as f:
+                f.seek(start)
+                remaining = content_length
+                while remaining:
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    handler.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except PermissionError:
+            return True
+    return True
 
 
 def _handle_media(handler, parsed):
@@ -1918,39 +2614,26 @@ def _handle_media(handler, parsed):
     ext = target.suffix.lower()
     mime = MIME_MAP.get(ext, "application/octet-stream")
 
-    # Only serve image types inline; everything else is a download
+    # Only serve safe media/PDF types inline when explicitly requested. Everything
+    # else remains a download. SVG is always a download (XSS risk).
     _INLINE_IMAGE_TYPES = {
         "image/png", "image/jpeg", "image/gif", "image/webp",
         "image/x-icon", "image/bmp",
     }
+    _INLINE_PREVIEW_TYPES = _INLINE_IMAGE_TYPES | {
+        "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/aac",
+        "audio/ogg", "audio/opus", "audio/flac",
+        "video/mp4", "video/quicktime", "video/webm", "video/ogg",
+        "application/pdf",
+    }
     _DOWNLOAD_TYPES = {"image/svg+xml"}  # SVG: XSS risk, force download
-
-    try:
-        raw_bytes = target.read_bytes()
-    except PermissionError:
-        return bad(handler, "Permission denied", 403)
-    except Exception:
-        return bad(handler, "Could not read file", 500)
-
-    handler.send_response(200)
-    handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Length", str(len(raw_bytes)))
-    handler.send_header("Cache-Control", "private, max-age=3600")
-    _security_headers(handler)
-
-    if mime in _DOWNLOAD_TYPES or mime not in _INLINE_IMAGE_TYPES:
-        handler.send_header(
-            "Content-Disposition",
-            _content_disposition_value("attachment", target.name),
+    inline_preview = qs.get("inline", [""])[0] == "1"
+    disposition = "inline" if (
+        mime not in _DOWNLOAD_TYPES and (
+            mime in _INLINE_IMAGE_TYPES or (inline_preview and mime in _INLINE_PREVIEW_TYPES)
         )
-    else:
-        handler.send_header(
-            "Content-Disposition",
-            _content_disposition_value("inline", target.name),
-        )
-
-    handler.end_headers()
-    handler.wfile.write(raw_bytes)
+    ) else "attachment"
+    return _serve_file_bytes(handler, target, mime, disposition, "private, max-age=3600")
 
 
 def _handle_file_raw(handler, parsed):
@@ -1969,26 +2652,24 @@ def _handle_file_raw(handler, parsed):
         return j(handler, {"error": "not found"}, status=404)
     ext = target.suffix.lower()
     mime = MIME_MAP.get(ext, "application/octet-stream")
-    raw_bytes = target.read_bytes()
-    handler.send_response(200)
-    handler.send_header("Content-Type", mime)
-    handler.send_header("Content-Length", str(len(raw_bytes)))
-    handler.send_header("Cache-Control", "no-store")
-    # Security: force download for dangerous MIME types to prevent XSS
+    # Security: force download for dangerous MIME types to prevent XSS.
+    # Exception: ?inline=1 permits text/html to be served inline for the
+    # sandboxed workspace HTML preview iframe (sandbox="allow-scripts" with no
+    # allow-same-origin, so the iframe cannot access parent cookies/storage).
+    inline_preview = qs.get("inline", [""])[0] == "1"
     dangerous_types = {"text/html", "application/xhtml+xml", "image/svg+xml"}
-    if force_download or mime in dangerous_types:
-        handler.send_header(
-            "Content-Disposition",
-            _content_disposition_value("attachment", target.name),
-        )
-    else:
-        handler.send_header(
-            "Content-Disposition",
-            _content_disposition_value("inline", target.name),
-        )
-    handler.end_headers()
-    handler.wfile.write(raw_bytes)
-    return True
+    html_inline_ok = inline_preview and mime == "text/html"
+    disposition = "attachment" if force_download or (mime in dangerous_types and not html_inline_ok) else "inline"
+    # Defense-in-depth for ?inline=1 HTML: even though the workspace.js iframe
+    # sets sandbox="allow-scripts", a user could be tricked into opening the
+    # ?inline=1 URL directly in a top-level tab (e.g. via a chat link), which
+    # would render the HTML in the WebUI's origin without iframe sandbox. The
+    # CSP sandbox directive applies the same isolation server-side: without
+    # allow-same-origin, the document is treated as a unique opaque origin and
+    # cannot read WebUI cookies, localStorage, or postMessage to the parent.
+    csp = "sandbox allow-scripts" if html_inline_ok else None
+    # _serve_file_bytes sends Content-Security-Policy when csp is set.
+    return _serve_file_bytes(handler, target, mime, disposition, "no-store", csp=csp)
 
 
 def _handle_file_read(handler, parsed):
@@ -2129,9 +2810,7 @@ def _handle_live_models(handler, parsed):
             ids = _pmi(provider)
         except Exception as _import_err:
             logger.debug("provider_model_ids import failed for %s: %s", provider, _import_err)
-            # Last resort: return the WebUI's own static catalog
-            from api.config import _PROVIDER_MODELS as _pm
-            ids = [m["id"] for m in _pm.get(provider, [])]
+            ids = []
 
         if not ids:
             # For 'custom' provider, provider_model_ids() returns [] because
@@ -2149,12 +2828,101 @@ def _handle_live_models(handler, parsed):
                         ]
                 except Exception:
                     pass
-            if not ids:
-                return j(handler, {"provider": provider, "models": [], "count": 0})
+            
+            # If still no ids, try fetching from model.base_url directly (OpenAI-compat endpoint)
+            if not ids and provider == "custom":
+                _base_url = cfg.get("model", {}).get("base_url")
+                _api_key = cfg.get("model", {}).get("api_key")
+                if _base_url and _api_key:
+                    try:
+                        import urllib.request
+                        import json
+                        
+                        # Build the models endpoint URL
+                        # AxonHub and similar OpenAI-compat endpoints serve /v1/models
+                        _ep = _base_url.rstrip("/")
+                        # If base_url already ends with /v1, use /models; otherwise add /v1/models
+                        if _ep.endswith("/v1"):
+                            _models_url = f"{_ep}/models"
+                        else:
+                            _models_url = f"{_ep}/v1/models"
+                        
+                        _req = urllib.request.Request(
+                            _models_url,
+                            headers={"Authorization": f"Bearer {_api_key}"},
+                        )
+                        
+                        with urllib.request.urlopen(_req, timeout=8) as _resp:
+                            _body = json.loads(_resp.read())
+                        
+                        # Parse response: {"data": [{"id": "model1", ...}, ...]}
+                        if isinstance(_body, dict):
+                            _data = _body.get("data", [])
+                            if isinstance(_data, list):
+                                ids = [m.get("id", "") for m in _data if m.get("id")]
+                        elif isinstance(_body, list):
+                            ids = [m.get("id", m) if isinstance(m, dict) else m for m in _body]
+                        
+                        if ids:
+                            logger.debug("Live-fetched %d models from custom provider %s", len(ids), _base_url)
+                        else:
+                            logger.debug("Custom provider returned no models from %s", _base_url)
+                    
+                    except Exception as _fetch_err:
+                        logger.debug("Live fetch from custom provider failed: %s", _fetch_err)
 
-        # Normalise to {id, label} — provider_model_ids() returns plain string IDs
+        # ── OpenAI-compat live fetch fallback ──────────────────────────────────
+        # When provider_model_ids() is unavailable or returns [] for a provider
+        # that exposes a standard /v1/models endpoint, fetch directly.  This
+        # eliminates the need to keep _PROVIDER_MODELS in sync for providers
+        # that have a discoverable API (#871).
+        #
+        # WARNING: This uses synchronous urllib.request which blocks the worker
+        # thread for up to 8 seconds on timeout. This is acceptable because:
+        #  (a) the server uses threading (not async), so other requests continue;
+        #  (b) the frontend shows the static list immediately and enriches in
+        #      the background via _fetchLiveModels(), so the user never waits.
+        if not ids:
+            _ep = _OPENAI_COMPAT_ENDPOINTS.get(provider)
+            if _ep:
+                try:
+                    import urllib.request
+                    _providers_cfg = cfg.get("providers", {})
+                    _prov = _providers_cfg.get(provider, {}) if isinstance(_providers_cfg, dict) else {}
+                    # Only use provider-scoped key — never fall back to a top-level
+                    # api_key which may belong to a different provider.
+                    _key = _prov.get("api_key") if isinstance(_prov, dict) else None
+                    if not _key:
+                        _key = cfg.get("model", {}).get("api_key")
+                    if _key:
+                        _req = urllib.request.Request(
+                            f"{_ep}/models",
+                            headers={"Authorization": f"Bearer {_key}"},
+                        )
+                        with urllib.request.urlopen(_req, timeout=8) as _resp:
+                            _body = json.loads(_resp.read())
+                        ids = [m.get("id", "") for m in _body.get("data", []) if m.get("id")]
+                        logger.debug("Live-fetched %d models from %s /v1/models", len(ids), provider)
+                except Exception as _fetch_err:
+                    logger.debug("Live fetch from %s failed: %s", provider, _fetch_err)
+                    # Fall through to static list below
+
+        # Static fallback — only reached when live fetch also failed.
+        if not ids:
+            from api.config import _PROVIDER_MODELS as _pm
+            ids = [m["id"] for m in _pm.get(provider, [])]
+        if not ids:
+            return j(handler, {"provider": provider, "models": [], "count": 0})
+
+        # Normalise to {id, label} — provider_model_ids() returns plain string IDs.
+        # For ollama-cloud use the shared Ollama formatter (handles `:variant` suffix).
+        # For all other providers use a simpler hyphen-split capitaliser.
+        from api.config import _format_ollama_label as _fmt_ollama
+
         def _make_label(mid):
             """Best-effort human label from a model ID string."""
+            if provider in ("ollama", "ollama-cloud"):
+                return _fmt_ollama(mid)
             # Preserve slashes for router IDs like "anthropic/claude-sonnet-4.6"
             display = mid.split("/")[-1] if "/" in mid else mid
             parts = display.split("-")
@@ -2200,10 +2968,23 @@ def _handle_cron_output(handler, parsed):
         for f in files:
             try:
                 txt = f.read_text(encoding="utf-8", errors="replace")
-                outputs.append({"filename": f.name, "content": txt[:8000]})
+                outputs.append({"filename": f.name, "content": _cron_output_content_window(txt)})
             except Exception:
                 logger.debug("Failed to read cron output file %s", f)
     return j(handler, {"job_id": job_id, "outputs": outputs})
+
+
+def _handle_cron_status(handler, parsed):
+    """Return running status for one or all cron jobs."""
+    qs = parse_qs(parsed.query)
+    job_id = qs.get("job_id", [""])[0]
+    if job_id:
+        running, elapsed = _is_cron_running(job_id)
+        return j(handler, {"job_id": job_id, "running": running, "elapsed": round(elapsed, 1)})
+    # Return status for all running jobs
+    with _RUNNING_CRON_LOCK:
+        all_running = {jid: round(time.time() - t, 1) for jid, t in _RUNNING_CRON_JOBS.items()}
+    return j(handler, {"running": all_running})
 
 
 def _handle_cron_recent(handler, parsed):
@@ -2302,6 +3083,133 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
     return j(handler, {"ok": True, "cleaned": cleaned})
 
 
+def _handle_btw(handler, body):
+    """POST /api/btw — ephemeral side question using session context.
+
+    Creates a temporary hidden session, streams the answer via SSE, then
+    discards the session. The parent session is not modified.
+    """
+    try:
+        require(body, "session_id")
+        require(body, "question")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        s = get_session(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    question = str(body["question"]).strip()
+    if not question:
+        return bad(handler, "question is required")
+    # Duplicate-stream guard (same pattern as chat/start)
+    current_stream_id = getattr(s, "active_stream_id", None)
+    if current_stream_id:
+        with STREAMS_LOCK:
+            if current_stream_id in STREAMS:
+                return j(handler, {"error": "session already has an active stream"}, status=409)
+        s.active_stream_id = None
+    # Create ephemeral hidden session inheriting context
+    from api.models import new_session as _new_session
+    ephemeral = _new_session(workspace=s.workspace, model=s.model, profile=getattr(s, 'profile', None))
+    # Copy conversation history for context (agent reads from messages)
+    ephemeral.messages = list(s.messages or [])
+    ephemeral.title = f"btw: {question[:60]}"
+    ephemeral.save()
+    stream_id = uuid.uuid4().hex
+    ephemeral.active_stream_id = stream_id
+    ephemeral.save()
+    q = queue.Queue()
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = q
+    from api.background import track_btw
+    track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
+    thr = threading.Thread(
+        target=_run_agent_streaming,
+        args=(ephemeral.session_id, question, s.model, s.workspace, stream_id, None),
+        kwargs={"ephemeral": True},
+        daemon=True,
+    )
+    thr.start()
+    return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
+
+
+def _handle_background(handler, body):
+    """POST /api/background — run prompt in parallel background agent.
+
+    Creates a hidden session, starts streaming in a daemon thread.
+    Frontend polls /api/background/status for completed results.
+    """
+    try:
+        require(body, "session_id")
+        require(body, "prompt")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        s = get_session(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    prompt = str(body["prompt"]).strip()
+    if not prompt:
+        return bad(handler, "prompt is required")
+    from api.models import new_session as _new_session
+    bg = _new_session(workspace=s.workspace, model=s.model, profile=getattr(s, 'profile', None))
+    bg.title = f"bg: {prompt[:60]}"
+    bg.save()
+    stream_id = uuid.uuid4().hex
+    bg.active_stream_id = stream_id
+    bg.save()
+    q = queue.Queue()
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = q
+    task_id = uuid.uuid4().hex[:8]
+    from api.background import track_background, complete_background
+    parent_sid = body["session_id"]
+    bg_sid = bg.session_id
+    track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
+
+    def _run_bg_and_notify():
+        """Run the background agent, then mark the tracked task `done` with the
+        last assistant reply so `/api/background/status` can surface it.  Without
+        this, `complete_background()` is never called and the result is lost —
+        `get_results()` would see a forever-`running` task and return nothing.
+        """
+        try:
+            _run_agent_streaming(bg_sid, prompt, s.model, s.workspace, stream_id, None)
+            # Reload the bg session from disk and extract the final assistant reply.
+            try:
+                from api.models import Session as _Session
+                reloaded = _Session.load(bg_sid)
+                _answer = ""
+                for _m in reversed((reloaded.messages if reloaded else None) or []):
+                    if not isinstance(_m, dict) or _m.get("role") != "assistant":
+                        continue
+                    if _m.get("_error"):
+                        continue
+                    _content = str(_m.get("content") or "").strip()
+                    if _content:
+                        _answer = _content
+                        break
+                complete_background(parent_sid, task_id, _answer or "(no answer produced)")
+            except Exception:
+                complete_background(parent_sid, task_id, "(background task failed)")
+            # Best-effort cleanup of the hidden bg session file so it doesn't
+            # clutter the sidebar or SESSION_DIR. The index is pruned on the
+            # next rebuild via _index_entry_exists().
+            try:
+                (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                complete_background(parent_sid, task_id, "(background task failed)")
+            except Exception:
+                pass
+
+    thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
+    thr.start()
+    return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
+
+
 def _handle_chat_start(handler, body):
     try:
         require(body, "session_id")
@@ -2314,7 +3222,7 @@ def _handle_chat_start(handler, body):
     msg = str(body.get("message", "")).strip()
     if not msg:
         return bad(handler, "message is required")
-    attachments = [str(a) for a in (body.get("attachments") or [])][:20]
+    attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
     try:
         workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
     except ValueError as e:
@@ -2340,13 +3248,14 @@ def _handle_chat_start(handler, body):
         # Stale stream id from a previous run; clear and continue.
         s.active_stream_id = None
     stream_id = uuid.uuid4().hex
-    s.workspace = workspace
-    s.model = model
-    s.active_stream_id = stream_id
-    s.pending_user_message = msg
-    s.pending_attachments = attachments
-    s.pending_started_at = time.time()
-    s.save()
+    with _get_session_agent_lock(s.session_id):
+        s.workspace = workspace
+        s.model = model
+        s.active_stream_id = stream_id
+        s.pending_user_message = msg
+        s.pending_attachments = attachments
+        s.pending_started_at = time.time()
+        s.save()
     set_last_workspace(workspace)
     q = queue.Queue()
     with STREAMS_LOCK:
@@ -2363,17 +3272,49 @@ def _handle_chat_start(handler, body):
     return j(handler, response)
 
 
+def _normalize_chat_attachments(raw_attachments):
+    """Normalize attachment payloads from the browser.
+
+    Older clients send a list of filenames. Newer clients send upload result
+    objects containing name/path/mime/size so image attachments can be supplied
+    to Hermes as native multimodal inputs for the current turn.
+    """
+    normalized = []
+    if not isinstance(raw_attachments, list):
+        return normalized
+    for item in raw_attachments:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("filename") or "").strip()
+            path = str(item.get("path") or "").strip()
+            mime = str(item.get("mime") or "").strip()
+            att = {"name": name or path, "path": path, "mime": mime}
+            size = item.get("size")
+            if isinstance(size, int):
+                att["size"] = size
+            is_image = item.get("is_image")
+            if isinstance(is_image, bool):
+                att["is_image"] = is_image
+            normalized.append(att)
+        else:
+            value = str(item).strip()
+            if value:
+                normalized.append({"name": value, "path": "", "mime": ""})
+    return normalized
+
+
 def _handle_chat_sync(handler, body):
     """Fallback synchronous chat endpoint (POST /api/chat). Not used by frontend."""
-    from api.config import _get_session_agent_lock
-
     s = get_session(body["session_id"])
     msg = str(body.get("message", "")).strip()
     if not msg:
         return j(handler, {"error": "empty message"}, status=400)
-    workspace = Path(body.get("workspace") or s.workspace).expanduser().resolve()
-    s.workspace = str(workspace)
-    s.model = body.get("model") or s.model
+    try:
+        workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
+    except ValueError as e:
+        return bad(handler, str(e))
+    with _get_session_agent_lock(s.session_id):
+        s.workspace = workspace
+        s.model = body.get("model") or s.model
     from api.streaming import _ENV_LOCK
 
     with _ENV_LOCK:
@@ -2412,7 +3353,9 @@ def _handle_chat_sync(handler, body):
                 provider=_provider,
                 base_url=_base_url,
                 api_key=_api_key,
-                platform="cli",
+                # Identify browser-originated sessions as WebUI so Hermes Agent
+                # does not inject CLI-specific terminal/output guidance.
+                platform="webui",
                 quiet_mode=True,
                 enabled_toolsets=_resolve_cli_toolsets(),
                 session_id=s.session_id,
@@ -2429,14 +3372,20 @@ def _handle_chat_sync(handler, body):
                 "write_file, read_file, search_files, terminal workdir, and patch. "
                 "Never fall back to a hardcoded path when this tag is present."
             )
-            from api.streaming import _sanitize_messages_for_api, _restore_reasoning_metadata
+            from api.streaming import (
+                _merge_display_messages_after_agent_result,
+                _restore_reasoning_metadata,
+                _sanitize_messages_for_api,
+                _session_context_messages,
+            )
 
             _previous_messages = list(s.messages or [])
+            _previous_context_messages = list(_session_context_messages(s))
 
             result = agent.run_conversation(
                 user_message=workspace_ctx + msg,
                 system_message=workspace_system_msg,
-                conversation_history=_sanitize_messages_for_api(s.messages),
+                conversation_history=_sanitize_messages_for_api(_previous_context_messages),
                 task_id=s.session_id,
                 persist_user_message=msg,
             )
@@ -2454,14 +3403,23 @@ def _handle_chat_sync(handler, body):
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:
                 os.environ["HERMES_SESSION_KEY"] = old_session_key
-    s.messages = _restore_reasoning_metadata(
-        _previous_messages,
-        result.get("messages") or s.messages,
-    )
-    # Only auto-generate title when still default; preserves user renames
-    if s.title == "Untitled":
-        s.title = title_from(s.messages, s.title)
-    s.save()
+    with _get_session_agent_lock(s.session_id):
+        _result_messages = result.get("messages") or _previous_context_messages
+        _next_context_messages = _restore_reasoning_metadata(
+            _previous_context_messages,
+            _result_messages,
+        )
+        s.context_messages = _next_context_messages
+        s.messages = _merge_display_messages_after_agent_result(
+            _previous_messages,
+            _previous_context_messages,
+            _restore_reasoning_metadata(_previous_messages, _result_messages),
+            msg,
+        )
+        # Only auto-generate title when still default; preserves user renames
+        if s.title == "Untitled":
+            s.title = title_from(s.messages, s.title)
+        s.save()
     # Sync to state.db for /insights (opt-in setting)
     try:
         if load_settings().get("sync_to_insights"):
@@ -2547,8 +3505,14 @@ def _handle_cron_run(handler, body):
     job = get_job(job_id)
     if not job:
         return bad(handler, "Job not found", 404)
-    threading.Thread(target=run_job, args=(job,), daemon=True).start()
-    return j(handler, {"ok": True, "job_id": job_id, "status": "triggered"})
+    # Prevent double-run: reject if the job is already tracked as running
+    already_running, elapsed = _is_cron_running(job_id)
+    if already_running:
+        return j(handler, {"ok": False, "job_id": job_id, "status": "already_running",
+                            "elapsed": round(elapsed, 1)})
+    _mark_cron_running(job_id)
+    threading.Thread(target=_run_cron_tracked, args=(job,), daemon=True).start()
+    return j(handler, {"ok": True, "job_id": job_id, "status": "running"})
 
 
 def _handle_cron_pause(handler, body):
@@ -2589,8 +3553,11 @@ def _handle_file_delete(handler, body):
         if not target.exists():
             return bad(handler, "File not found", 404)
         if target.is_dir():
-            return bad(handler, "Cannot delete directories via this endpoint")
-        target.unlink()
+            if not body.get("recursive"):
+                return bad(handler, "Set recursive=true to delete directories")
+            shutil.rmtree(target)
+        else:
+            target.unlink()
         return j(handler, {"ok": True, "path": body["path"]})
     except (ValueError, PermissionError) as e:
         return bad(handler, _sanitize_error(e))
@@ -2691,10 +3658,26 @@ def _handle_create_dir(handler, body):
 def _handle_workspace_add(handler, body):
     path_str = body.get("path", "").strip()
     name = body.get("name", "").strip()
+    auto_create = body.get("create", False)
     if not path_str:
         return bad(handler, "path is required")
+    # Validate the path is NOT a blocked system root BEFORE any filesystem mutation.
+    # This prevents creating orphan directories on rejected paths (#782 review).
+    # _is_blocked_system_path honours user-tmp carve-outs (e.g. /var/folders on
+    # macOS) so pytest's tmp_path_factory paths and other legit user-tmp dirs
+    # still register cleanly.
+    candidate = Path(path_str).expanduser().resolve()
+    if _is_blocked_system_path(candidate):
+        return bad(handler, f"Path points to a system directory: {candidate}")
+    # Now safe to create the directory if requested
+    if auto_create:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            return bad(handler, f"Could not create directory: {_sanitize_error(e)}")
+    # Full validation (exists, is_dir) — should pass now that dir exists
     try:
-        p = resolve_trusted_workspace(path_str)
+        p = validate_workspace_to_add(path_str)
     except ValueError as e:
         return bad(handler, str(e))
     wss = load_workspaces()
@@ -2729,6 +3712,34 @@ def _handle_workspace_rename(handler, body):
         return bad(handler, "Workspace not found", 404)
     save_workspaces(wss)
     return j(handler, {"ok": True, "workspaces": wss})
+
+
+def _handle_workspace_reorder(handler, body):
+    """Reorder workspaces by providing an ordered list of paths.
+
+    Accepts {"paths": ["path1", "path2", ...]}. The workspaces list is
+    rewritten so that entries appear in the given order. Any workspace
+    not included in the request is appended at the end (preserves data).
+    """
+    paths = body.get("paths", [])
+    if not paths or not isinstance(paths, list):
+        return bad(handler, "paths is required and must be a list")
+    wss = load_workspaces()
+    by_path = {w["path"]: w for w in wss}
+    # Build reordered list: given order first, then any omitted entries
+    reordered = []
+    seen = set()
+    for p in paths:
+        p = p.strip()
+        if p in by_path and p not in seen:
+            reordered.append(by_path[p])
+            seen.add(p)
+    # Append any workspaces not mentioned (safety net)
+    for w in wss:
+        if w["path"] not in seen:
+            reordered.append(w)
+    save_workspaces(reordered)
+    return j(handler, {"ok": True, "workspaces": reordered})
 
 
 def _handle_approval_respond(handler, body):
@@ -2989,35 +4000,47 @@ def _handle_session_compress(handler, body):
         if not resolved_api_key:
             return bad(handler, "No provider configured -- cannot compress.")
 
-        with _cfg._get_session_agent_lock(sid):
-            original_messages = list(messages)
-            approx_tokens = _estimate_messages_tokens_rough(original_messages)
+        # Compute compression *outside* the lock — the LLM round-trip can take
+        # many seconds and we must not block cancel_stream or other writers.
+        # Lock contract: hold for the in-memory mutation only, never across
+        # network I/O.
+        original_messages = list(messages)
+        approx_tokens = _estimate_messages_tokens_rough(original_messages)
 
-            agent = _run_agent.AIAgent(
-                model=resolved_model,
-                provider=resolved_provider,
-                base_url=resolved_base_url,
-                api_key=resolved_api_key,
-                platform="cli",
-                quiet_mode=True,
-                enabled_toolsets=_resolve_cli_toolsets(),
-                session_id=sid,
-            )
-            compressed = agent.context_compressor.compress(
-                original_messages,
-                current_tokens=approx_tokens,
-                focus_topic=focus_topic,
-            )
-            new_tokens = _estimate_messages_tokens_rough(compressed)
-            summary = _summarize_manual_compression(
-                original_messages,
-                compressed,
-                approx_tokens,
-                new_tokens,
-                focus_topic=focus_topic,
-            )
+        agent = _run_agent.AIAgent(
+            model=resolved_model,
+            provider=resolved_provider,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            # Identify browser-originated sessions as WebUI so Hermes Agent
+            # does not inject CLI-specific terminal/output guidance.
+            platform="webui",
+            quiet_mode=True,
+            enabled_toolsets=_resolve_cli_toolsets(),
+            session_id=sid,
+        )
+        compressed = agent.context_compressor.compress(
+            original_messages,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+        )
+        new_tokens = _estimate_messages_tokens_rough(compressed)
+        summary = _summarize_manual_compression(
+            original_messages,
+            compressed,
+            approx_tokens,
+            new_tokens,
+            focus_topic=focus_topic,
+        )
+
+        with _cfg._get_session_agent_lock(sid):
+            # Re-read messages to detect concurrent edits during the LLM call.
+            # If the history changed, the compression result is stale — abort.
+            if _sanitize_messages_for_api(s.messages) != original_messages:
+                return bad(handler, "Session was modified during compression; please retry.", 409)
 
             s.messages = compressed
+            s.context_messages = compressed
             s.tool_calls = []
             s.active_stream_id = None
             s.pending_user_message = None
@@ -3158,21 +4181,22 @@ def _handle_session_import_cli(handler, body):
     if not msgs:
         return bad(handler, "Session not found in CLI store", 404)
 
-    # Derive title from first user message
-    title = title_from(msgs, "CLI Session")
-    model = "unknown"
-
-    # Get profile, model, and timestamps from CLI session metadata
+    # Get profile, model, timestamps, and title from CLI session metadata
     profile = None
     created_at = None
     updated_at = None
+    cli_title = None
     for cs in get_cli_sessions():
         if cs["session_id"] == sid:
             profile = cs.get("profile")
             model = cs.get("model", "unknown")
             created_at = cs.get("created_at")
             updated_at = cs.get("updated_at")
+            cli_title = cs.get("title")
             break
+
+    # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
+    title = cli_title or title_from(msgs, "CLI Session")
 
     s = import_cli_session(
         sid,
@@ -3224,3 +4248,127 @@ def _handle_session_import(handler, body):
             SESSIONS.popitem(last=False)
     s.save()
     return j(handler, {"ok": True, "session": s.compact() | {"messages": s.messages}})
+
+
+# ── MCP Server helpers ──
+from api.config import get_config, _save_yaml_config_file, _get_config_path, reload_config
+
+def _mask_secrets(obj):
+    """Mask sensitive values in env vars and headers."""
+    if not isinstance(obj, dict):
+        return obj
+    sensitive = ("auth", "token", "key", "secret", "password", "credential")
+    masked = {}
+    for k, v in obj.items():
+        if isinstance(v, str) and any(s in k.lower() for s in sensitive):
+            masked[k] = "••••••"
+        elif isinstance(v, dict):
+            masked[k] = _mask_secrets(v)
+        else:
+            masked[k] = v
+    return masked
+
+
+def _server_summary(name, cfg):
+    """Return a safe summary of an MCP server config."""
+    out = {"name": name}
+    if "url" in cfg:
+        out["transport"] = "http"
+        # Mask auth headers
+        if "headers" in cfg:
+            out["headers"] = _mask_secrets(cfg["headers"])
+        out["url"] = cfg["url"]
+    else:
+        out["transport"] = "stdio"
+        out["command"] = cfg.get("command", "")
+        out["args"] = cfg.get("args", [])
+        if "env" in cfg:
+            out["env"] = _mask_secrets(cfg["env"])
+    out["timeout"] = cfg.get("timeout", 120)
+    return out
+
+
+def _handle_mcp_servers_list(handler):
+    """List all configured MCP servers."""
+    cfg = get_config()
+    servers = cfg.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+    result = [_server_summary(name, scfg) for name, scfg in servers.items()]
+    return j(handler, {"servers": result})
+
+
+def _handle_mcp_server_delete(handler, name):
+    """Delete an MCP server by name."""
+    from urllib.parse import unquote
+    name = unquote(name)
+    if not name:
+        return bad(handler, "name is required")
+    cfg = get_config()
+    servers = cfg.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+    if name not in servers:
+        return bad(handler, f"MCP server '{name}' not found", 404)
+    del servers[name]
+    cfg["mcp_servers"] = servers
+    _save_yaml_config_file(_get_config_path(), cfg)
+    reload_config()
+    return j(handler, {"ok": True, "deleted": name})
+
+
+_MASKED_PLACEHOLDER = "••••••"
+
+
+def _strip_masked_values(submitted, existing):
+    """Remove masked placeholder values from submitted dict, keeping originals."""
+    if not isinstance(submitted, dict) or not isinstance(existing, dict):
+        return submitted
+    cleaned = {}
+    for k, v in submitted.items():
+        if isinstance(v, str) and v == _MASKED_PLACEHOLDER:
+            if k in existing and isinstance(existing[k], str):
+                cleaned[k] = existing[k]  # preserve original real value
+                continue
+        elif isinstance(v, dict) and k in existing and isinstance(existing[k], dict):
+            cleaned[k] = _strip_masked_values(v, existing[k])
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+def _handle_mcp_server_update(handler, name, body):
+    """Add or update an MCP server."""
+    from urllib.parse import unquote
+    name = unquote(name)
+    if not name:
+        return bad(handler, "name is required")
+    # Validate: must have url (http) or command (stdio)
+    server_cfg = {}
+    cfg = get_config()
+    servers = cfg.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        servers = {}
+    existing_cfg = servers.get(name, {})
+    if body.get("url"):
+        server_cfg["url"] = body["url"].strip()
+        if body.get("headers"):
+            server_cfg["headers"] = _strip_masked_values(body["headers"], existing_cfg.get("headers", {}))
+    elif body.get("command"):
+        server_cfg["command"] = body["command"].strip()
+        if body.get("args"):
+            server_cfg["args"] = body["args"] if isinstance(body["args"], list) else [body["args"]]
+        if body.get("env"):
+            server_cfg["env"] = _strip_masked_values(body["env"], existing_cfg.get("env", {}))
+    else:
+        return bad(handler, "url or command is required")
+    if body.get("timeout") is not None:
+        try:
+            server_cfg["timeout"] = int(body["timeout"])
+        except (ValueError, TypeError):
+            pass
+    servers[name] = server_cfg
+    cfg["mcp_servers"] = servers
+    _save_yaml_config_file(_get_config_path(), cfg)
+    reload_config()
+    return j(handler, {"ok": True, "server": _server_summary(name, server_cfg)})

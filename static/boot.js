@@ -7,7 +7,6 @@ async function cancelStream(){
   // Clear status unconditionally after the cancel request completes.
   // The SSE cancel event may also fire, but if the connection is already
   // closed it won't arrive — so we handle cleanup here as the guaranteed path.
-  const btn=$('btnCancel');if(btn)btn.style.display='none';
   S.activeStreamId=null;
   setBusy(false);
   if(typeof setComposerStatus==='function') setComposerStatus('');
@@ -42,6 +41,8 @@ function _setWorkspacePanelMode(mode){
   const open=_workspacePanelMode!=='closed';
   document.documentElement.dataset.workspacePanel=open?'open':'closed';
   // Persist open/closed across refreshes (browse/preview → open; closed → closed)
+  // Do NOT overwrite the user's "keep open" preference — only track runtime state
+  // so that toggleWorkspacePanel(false) from the toolbar doesn't clear the setting.
   localStorage.setItem('hermes-webui-workspace-panel', open ? 'open' : 'closed');
   layout.classList.toggle('workspace-panel-collapsed',!open);
   if(_isCompactWorkspaceViewport()){
@@ -60,14 +61,19 @@ function syncWorkspacePanelState(){
     return;
   }
   if(!S.session){
-    _setWorkspacePanelMode('closed');
+    // No active session — if the panel was explicitly opened (browse mode), keep it
+    // open so the workspace pane doesn't vanish on a fresh-page or empty-session boot.
+    // The file tree will show the "no workspace" placeholder naturally via renderFileTree().
+    // Only force-close if the mode is 'preview' (file preview without a session is invalid).
+    if(_workspacePanelMode==='preview') _setWorkspacePanelMode('closed');
+    else syncWorkspacePanelUI();
     return;
   }
   _setWorkspacePanelMode(_workspacePanelMode==='preview'?'closed':_workspacePanelMode);
 }
 
 function openWorkspacePanel(mode='browse'){
-  if(mode==='browse'&&!S.session&&!_hasWorkspacePreviewVisible())return;
+  if(mode==='browse'&&!S.session&&!_hasWorkspacePreviewVisible()&&!S._profileDefaultWorkspace)return;
   if(mode==='preview'&&_workspacePanelMode==='browse'){
     syncWorkspacePanelUI();
     return;
@@ -99,7 +105,7 @@ function syncWorkspacePanelUI(){
   const mobileOpen=panel.classList.contains('mobile-open');
   const isCompact=_isCompactWorkspaceViewport();
   const isOpen=isCompact?mobileOpen:desktopOpen;
-  const canBrowse=!!S.session||_hasWorkspacePreviewVisible();
+  const canBrowse=!!S.session||_hasWorkspacePreviewVisible()||!!(S._profileDefaultWorkspace);
   const hasPreview=_hasWorkspacePreviewVisible();
   if(toggleBtn){
     toggleBtn.classList.toggle('active',isOpen);
@@ -170,6 +176,7 @@ function mobileSwitchPanel(name){
 }
 
 $('btnSend').onclick=()=>{
+  if(typeof handleComposerPrimaryAction==='function') return handleComposerPrimaryAction();
   if(window._micActive){
     window._micPendingSend=true;
     _stopMic();
@@ -380,7 +387,12 @@ $('btnAttach').onclick=()=>$('fileInput').click();
 window._micActive=window._micActive||false;
 window._micPendingSend=window._micPendingSend||false;
 $('fileInput').onchange=e=>{addFiles(Array.from(e.target.files));e.target.value='';};
-$('btnNewChat').onclick=async()=>{await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();};
+$('btnNewChat').onclick=async()=>{
+  // If the current session has no messages, just focus the composer rather than
+  // creating another empty session that will clutter the sidebar list (#1171).
+  if(S.session&&(S.session.message_count||0)===0){$('msg').focus();closeMobileSidebar();return;}
+  await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+};
 $('btnDownload').onclick=()=>{
   if(!S.session)return;
   const blob=new Blob([transcript()],{type:'text/markdown'});
@@ -405,8 +417,7 @@ $('importFileInput').onchange=async(e)=>{
     if(res.ok&&res.session){
       await loadSession(res.session.session_id);
       await renderSessionList();
-      const overlay=$('settingsOverlay');
-      if(overlay) overlay.style.display='none';
+      if(_currentPanel==='settings') switchPanel('chat');
       showToast(t('session_imported'));
     }
   }catch(err){
@@ -415,16 +426,18 @@ $('importFileInput').onchange=async(e)=>{
 };
 // btnRefreshFiles is now panel-icon-btn in header (see HTML)
 function clearPreview(){
+  // Restore directory breadcrumb after closing file preview
+  if(typeof renderBreadcrumb==='function') renderBreadcrumb();
   const closePanelAfter=_workspacePanelMode==='preview';
   const pa=$('previewArea');if(pa)pa.classList.remove('visible');
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
+  const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
+  const html=$('previewHtmlIframe');if(html)html.src='';
   const pm=$('previewMd');if(pm)pm.innerHTML='';
   const pc=$('previewCode');if(pc)pc.textContent='';
   const pp=$('previewPathText');if(pp)pp.textContent='';
   const ft=$('fileTree');if(ft)ft.style.display='';
   _previewCurrentPath='';_previewCurrentMode='';_previewDirty=false;
-  // Restore directory breadcrumb after closing file preview
-  if(typeof renderBreadcrumb==='function') renderBreadcrumb();
   if(closePanelAfter)closeWorkspacePanel();
   else syncWorkspacePanelUI();
 }
@@ -444,9 +457,9 @@ $('modelSelect').onchange=async()=>{
     const warn=_checkProviderMismatch(selectedModel);
     if(warn&&typeof showToast==='function') showToast(warn,4000);
   }
-  // Notify user that model changes only take effect in the next conversation (#419)
-  if(S.messages && S.messages.length > 0 && typeof showToast==='function'){
-    showToast('Model change takes effect in your next conversation', 3000);
+  // Clarify scope: composer model changes are session-local, not the global default.
+  if(typeof showToast==='function'){
+    showToast(t('model_scope_toast')||'Applies to this conversation from your next message.', 3000);
   }
 };
 $('msg').addEventListener('input',()=>{
@@ -515,7 +528,15 @@ document.addEventListener('keydown',async e=>{
   }
   if((e.metaKey||e.ctrlKey)&&e.key==='k'){
     e.preventDefault();
-    if(!S.busy){await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();}
+    // If the current session has no messages, just focus the composer rather than
+    // creating another empty session that will clutter the sidebar list (#1171).
+    if(S.session&&(S.session.message_count||0)===0){$('msg').focus();return;}
+    // Cmd/Ctrl+K should always create a new conversation, even while the current
+    // one is still streaming. The old !S.busy guard meant users had to wait for
+    // a long generation to finish before they could start something new — exactly
+    // the moment they want to switch context. newSession() leaves the in-flight
+    // stream running on its own session; the user just gets a fresh blank one.
+    await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
   }
   if(e.key==='Escape'){
     // Close onboarding overlay if open (skip/dismiss the wizard)
@@ -524,9 +545,8 @@ document.addEventListener('keydown',async e=>{
       if(typeof skipOnboarding==='function') skipOnboarding();
       return;
     }
-    // Close settings overlay if open
-    const settingsOverlay=$('settingsOverlay');
-    if(settingsOverlay&&settingsOverlay.style.display!=='none'){_closeSettingsPanel();return;}
+    // Close settings panel if active
+    if(_currentPanel==='settings'){_closeSettingsPanel();return;}
     // Close workspace dropdown
     closeWsDropdown();
     // Clear session search
@@ -611,6 +631,11 @@ window.addEventListener('resize',()=>{
 })();
 
 // ── Appearance helpers (theme = light/dark/system, skin = accent color) ──────
+const _THEMES=[
+  {name:'Light', value:'light', colors:['#FEFCF7','#FAF7F0','#B8860B']},
+  {name:'Dark', value:'dark', colors:['#0D0D1A','#141425','#FFD700']},
+  {name:'System', value:'system', colors:['#FEFCF7','#0D0D1A','#B8860B']},
+];
 const _SKINS=[
   {name:'Default',  colors:['#FFD700','#FFBF00','#CD7F32']},
   {name:'Ares',     colors:['#FF4444','#CC3333','#992222']},
@@ -619,8 +644,9 @@ const _SKINS=[
   {name:'Poseidon', colors:['#0EA5E9','#0284C7','#0369A1']},
   {name:'Sisyphus', colors:['#A78BFA','#8B5CF6','#7C3AED']},
   {name:'Charizard',colors:['#FB923C','#F97316','#EA580C']},
+  {name:'Sienna',   colors:['#D97757','#C06A49','#9A523A']},
 ];
-const _VALID_THEMES=new Set(['system','dark','light']);
+const _VALID_THEMES=new Set((_THEMES||[]).map(t=>t.value));
 const _VALID_SKINS=new Set((_SKINS||[]).map(s=>s.name.toLowerCase()));
 const _LEGACY_THEME_MAP={
   slate:{theme:'dark',skin:'slate'},
@@ -648,11 +674,14 @@ function _setResolvedTheme(isDark){
   const want=isDark
     ?'https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css'
     :'https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css';
-  if(link.href!==want){ link.href=want; }
+  // No SRI integrity on theme CSS — jsdelivr edge nodes serve different
+  // digests for the same pinned version, causing intermittent blocking (#1100).
+  if(link.href!==want){ link.integrity=''; link.href=want; }
 }
 
 function _applyTheme(name){
   const normalized=_normalizeAppearance(name,'default');
+  delete document.documentElement.dataset.theme;
   if(_systemThemeMq&&_onSystemThemeChange){
     _systemThemeMq.removeEventListener('change',_onSystemThemeChange);
     _systemThemeMq=null;
@@ -683,11 +712,11 @@ function _pickTheme(name){
   _applySkin(appearance.skin);
   _syncThemePicker(appearance.theme);
   _syncSkinPicker(appearance.skin);
-  if(typeof _markSettingsDirty==='function') _markSettingsDirty();
   const hidden=$('settingsTheme');
   if(hidden) hidden.value=appearance.theme;
   const skinHidden=$('settingsSkin');
   if(skinHidden) skinHidden.value=appearance.skin;
+  if(typeof _scheduleAppearanceAutosave==='function') _scheduleAppearanceAutosave();
 }
 
 function _pickSkin(name){
@@ -698,26 +727,26 @@ function _pickSkin(name){
   _applySkin(appearance.skin);
   _syncThemePicker(appearance.theme);
   _syncSkinPicker(appearance.skin);
-  if(typeof _markSettingsDirty==='function') _markSettingsDirty();
   const hidden=$('settingsSkin');
   if(hidden) hidden.value=appearance.skin;
   const themeHidden=$('settingsTheme');
   if(themeHidden) themeHidden.value=appearance.theme;
+  if(typeof _scheduleAppearanceAutosave==='function') _scheduleAppearanceAutosave();
 }
 
 function _syncThemePicker(active){
   document.querySelectorAll('#themePickerGrid .theme-pick-btn').forEach(btn=>{
-    const sel=btn.dataset.themeVal===active;
-    btn.style.borderColor=sel?'var(--accent)':'var(--border2)';
-    btn.style.boxShadow=sel?'0 0 0 1px var(--accent-bg-strong)':'none';
+    btn.classList.toggle('active',btn.dataset.themeVal===active);
+    btn.style.borderColor='';
+    btn.style.boxShadow='';
   });
 }
 
 function _syncSkinPicker(active){
   document.querySelectorAll('#skinPickerGrid .skin-pick-btn').forEach(btn=>{
-    const sel=btn.dataset.skinVal===active;
-    btn.style.borderColor=sel?'var(--accent)':'var(--border2)';
-    btn.style.boxShadow=sel?'0 0 0 1px var(--accent-bg-strong)':'none';
+    btn.classList.toggle('active',btn.dataset.skinVal===active);
+    btn.style.borderColor='';
+    btn.style.boxShadow='';
   });
 }
 
@@ -733,16 +762,16 @@ function _pickFontSize(size){
   localStorage.setItem('hermes-font-size',size);
   _applyFontSize(size);
   _syncFontSizePicker(size);
-  if(typeof _markSettingsDirty==='function') _markSettingsDirty();
   const hidden=$('settingsFontSize');
   if(hidden) hidden.value=size;
+  if(typeof _scheduleAppearanceAutosave==='function') _scheduleAppearanceAutosave();
 }
 
 function _syncFontSizePicker(active){
   document.querySelectorAll('#fontSizePickerGrid .font-size-pick-btn').forEach(btn=>{
-    const sel=btn.dataset.fontSizeVal===(active||'default');
-    btn.style.borderColor=sel?'var(--accent)':'var(--border2)';
-    btn.style.boxShadow=sel?'0 0 0 1px var(--accent-bg-strong)':'none';
+    btn.classList.toggle('active',btn.dataset.fontSizeVal===(active||'default'));
+    btn.style.borderColor='';
+    btn.style.boxShadow='';
   });
 }
 
@@ -766,7 +795,15 @@ function _buildSkinPicker(activeSkin){
 }
 
 function applyBotName(){
-  const name=window._botName||'Hermes';
+  // Prefer profile name over global bot_name for personalised placeholder.
+  // If activeProfile is set and not 'default', use it (capitalised).
+  // Falls back to window._botName (global bot_name setting) or 'Hermes'.
+  let name;
+  if(S.activeProfile && S.activeProfile!=='default'){
+    name=S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
+  }else{
+    name=window._botName||'Hermes';
+  }
   document.title=name;
   const sidebarH1=document.querySelector('.sidebar-header h1');
   if(sidebarH1) sidebarH1.textContent=name;
@@ -790,8 +827,11 @@ function applyBotName(){
     window._soundEnabled=!!s.sound_enabled;
     window._notificationsEnabled=!!s.notifications_enabled;
     window._showThinking=s.show_thinking!==false;
+    window._simplifiedToolCalling=s.simplified_tool_calling!==false;
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
+    window._busyInputMode=(s.busy_input_mode||'queue');
     window._botName=s.bot_name||'Hermes';
+    if(s.default_model) window._defaultModel=s.default_model;
     // Persist default workspace so the blank new-chat page can show it
     // and workspace actions (New file/folder) work before the first session (#804).
     if(s.default_workspace) S._profileDefaultWorkspace=s.default_workspace;
@@ -800,6 +840,9 @@ function applyBotName(){
     _applyTheme(appearance.theme);
     localStorage.setItem('hermes-skin',appearance.skin);
     _applySkin(appearance.skin);
+    const fontSize=(s.font_size||localStorage.getItem('hermes-font-size')||'default');
+    localStorage.setItem('hermes-font-size',fontSize);
+    _applyFontSize(fontSize);
     if(typeof setLocale==='function'){
       const _lang=typeof resolvePreferredLocale==='function'
         ? resolvePreferredLocale(s.language, localStorage.getItem('hermes-lang'))
@@ -808,6 +851,8 @@ function applyBotName(){
       if(typeof applyLocaleToDOM==='function')applyLocaleToDOM();
     }
     applyBotName();
+    // TTS: apply enabled state on boot so buttons show/hide correctly (#499)
+    if(typeof _applyTtsEnabled==='function') _applyTtsEnabled(localStorage.getItem('hermes-tts-enabled')==='true');
   }catch(e){
     window._sendKey='enter';
     window._showTokenUsage=false;
@@ -815,7 +860,9 @@ function applyBotName(){
     window._soundEnabled=false;
     window._notificationsEnabled=false;
     window._showThinking=true;
+    window._simplifiedToolCalling=true;
     window._sidebarDensity='compact';
+    window._busyInputMode='queue';
     window._botName='Hermes';
     _bootSettings={check_for_updates:false};
     if(typeof setLocale==='function'){
@@ -826,6 +873,7 @@ function applyBotName(){
       if(typeof applyLocaleToDOM==='function')applyLocaleToDOM();
     }
     applyBotName();
+    if(typeof _applyTtsEnabled==='function') _applyTtsEnabled(localStorage.getItem('hermes-tts-enabled')==='true');
   }
   // Non-blocking update check (fire-and-forget, once per tab session)
   // ?test_updates=1 in URL forces banner display for testing (bypasses sessionStorage guards)
@@ -839,18 +887,26 @@ function applyBotName(){
   // Update profile chip label immediately
   const profileLabel=$('profileChipLabel');
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
-  // Fetch available models from server and populate dropdown dynamically
-  await populateModelDropdown();
-  // Restore last-used model preference
-  const savedModel=localStorage.getItem('hermes-webui-model');
-  if(savedModel && $('modelSelect')){
-    $('modelSelect').value=savedModel;
-    // If the value didn't take (model not in list), clear the bad pref
-    if($('modelSelect').value!==savedModel) localStorage.removeItem('hermes-webui-model');
-  }
-  // Pre-load workspace list so sidebar name is correct from first render
+  // Fetch available models without blocking session restore. The static HTML
+  // options are enough for first paint; the dynamic provider list can settle
+  // after the saved session is visible.
+  const _modelDropdownReady=populateModelDropdown().then(()=>{
+    const savedModel=localStorage.getItem('hermes-webui-model');
+    if(savedModel && $('modelSelect')){
+      $('modelSelect').value=savedModel;
+      // If the value didn't take (model not in list), clear the bad pref
+      if($('modelSelect').value!==savedModel) localStorage.removeItem('hermes-webui-model');
+      else if(typeof syncModelChip==='function') syncModelChip();
+    }
+    if(S.session) syncTopbar();
+  }).catch(()=>{});
+  window._modelDropdownReady=_modelDropdownReady;
+  // Pre-load workspace list so sidebar name is correct from first render.
+  // Render the session list before restoring the saved conversation so a stale
+  // saved-session/client-side boot error cannot leave the sidebar empty forever.
   await loadWorkspaceList();
   await loadOnboardingWizard();
+  await renderSessionList();
   _initResizePanels();
   // Workspace panel restore happens AFTER loadSession so we know if
   // the session has a workspace — prevents the snap-open-then-closed flash (#576).
@@ -859,13 +915,38 @@ function applyBotName(){
   // separately below by a `pageshow` listener — the async IIFE here does NOT
   // re-run when the browser restores the page from bfcache.
   const _srch = document.getElementById('sessionSearch'); if (_srch) _srch.value = '';
+  // Initialize reasoning chip on boot (fixes #1103 — chip hidden until session load)
+  if(typeof fetchReasoningChip==='function') fetchReasoningChip();
   const saved=localStorage.getItem('hermes-webui-session');
   if(saved){
     try{
       await loadSession(saved);
-      // Only restore the panel from localStorage when the session actually has a workspace.
-      // Without this guard, sessions without a workspace snap open then immediately closed.
-      if(S.session&&S.session.workspace&&localStorage.getItem('hermes-webui-workspace-panel')==='open'){
+      // If the restored session has no messages it is an ephemeral scratch pad —
+      // treat the page as a fresh start rather than resuming a blank conversation.
+      // loadSession() already ran, so loadDir() has populated the workspace file tree.
+      // Do NOT remove the session ID from localStorage — keeping it means every
+      // subsequent refresh will also run loadSession() → loadDir() → files stay visible.
+      // Removing it here caused the file tree to go blank on the second refresh
+      // because the "no saved session" path never calls loadDir (#workspace-files).
+      if(S.session && (S.session.message_count||0) === 0){
+        S.session=null; S.messages=[];
+        S._bootReady=true;
+        // Restore panel pref before syncing so the workspace panel stays visible
+        // even though there is no active session (#workspace-persist).
+        const _ephPanelPref=localStorage.getItem('hermes-webui-workspace-panel-pref')==='open'
+          || localStorage.getItem('hermes-webui-workspace-panel')==='open';
+        if(_ephPanelPref) _workspacePanelMode='browse';
+        syncTopbar();syncWorkspacePanelState();
+        $('emptyState').style.display='';
+        await renderSessionList();if(typeof startGatewaySSE==='function')startGatewaySSE();
+        return;
+      }
+      // Restore the panel from localStorage when the session has a workspace.
+      // Preference key takes priority over runtime state so that closing
+      // the panel via toolbar X doesn't suppress the "keep open" setting.
+      const panelPref=localStorage.getItem('hermes-webui-workspace-panel-pref')==='open'
+        || localStorage.getItem('hermes-webui-workspace-panel')==='open';
+      if(S.session&&S.session.workspace&&panelPref){
         _workspacePanelMode='browse';
       }
       S._bootReady=true;
@@ -875,24 +956,50 @@ function applyBotName(){
   // no saved session - show empty state, wait for user to hit +
   S._bootReady=true;
   syncTopbar();
+  // Restore panel pref so the workspace panel stays visible on a fresh load if the
+  // user had it open during their last session (#workspace-persist).
+  const _freshPanelPref=localStorage.getItem('hermes-webui-workspace-panel-pref')==='open'
+    || localStorage.getItem('hermes-webui-workspace-panel')==='open';
+  if(_freshPanelPref) _workspacePanelMode='browse';
   syncWorkspacePanelState();
   $('emptyState').style.display='';
   await renderSessionList();
   // Start real-time gateway session sync if setting is enabled
   if(typeof startGatewaySSE==='function') startGatewaySSE();
-})();
+})().catch(e=>{
+  console.error('[hermes] boot failed', e);
+  try{S._bootReady=true;}catch(_){}
+  try{syncTopbar();}catch(_){}
+  try{syncWorkspacePanelState();}catch(_){}
+  try{$('emptyState').style.display='';}catch(_){}
+  try{if(typeof renderSessionList==='function') void renderSessionList();}catch(_){}
+});
 
 // Fix #822 (bfcache path): when the browser restores the page from the
 // back-forward cache, the async boot IIFE above does NOT re-run, but the
 // DOM — including any stale value in #sessionSearch — IS restored.  A
 // prior search string would silently hide all sessions via the filter in
-// renderSessionListFromCache().  Clear the field and re-render whenever
-// the page is restored from cache (`event.persisted === true`).
+// renderSessionListFromCache().  Clear the field and re-run the full layout
+// sync whenever the page is restored from cache (`event.persisted === true`).
+// Fix #1045: also re-run topbar/workspace/panel state so the rail and layout
+// chrome aren't left in the stale bfcache snapshot.
 window.addEventListener('pageshow', (event) => {
   if (!event.persisted) return;  // fresh loads are handled by the IIFE above
   const _srch = document.getElementById('sessionSearch');
   if (_srch) _srch.value = '';
+  // Close any dropdowns/popovers that were open when the user navigated away.
+  // bfcache freezes DOM state, so a dropdown left open remains open on restore.
+  if (typeof closeModelDropdown === 'function') try { closeModelDropdown(); } catch (_) {}
+  if (typeof closeReasoningDropdown === 'function') try { closeReasoningDropdown(); } catch (_) {}
+  if (typeof closeWsDropdown === 'function') try { closeWsDropdown(); } catch (_) {}
+  if (typeof closeProfileDropdown === 'function') try { closeProfileDropdown(); } catch (_) {}
+  // Re-synchronise layout chrome that the boot IIFE sets up but bfcache
+  // doesn't re-run. Each call is guarded so missing helpers degrade silently.
+  if (typeof syncTopbar === 'function') try { syncTopbar(); } catch (_) {}
+  if (typeof syncWorkspacePanelState === 'function') try { syncWorkspacePanelState(); } catch (_) {}
   if (typeof renderSessionListFromCache === 'function') {
     try { renderSessionListFromCache(); } catch (_) {}
   }
+  // Restart the gateway SSE watcher — the persisted connection is dead after bfcache
+  if (typeof startGatewaySSE === 'function') try { startGatewaySSE(); } catch (_) {}
 });

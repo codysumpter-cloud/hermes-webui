@@ -433,7 +433,9 @@ def test_done_handler_sets_busy_false_before_renderMessages(cleanup_test_session
     if done_idx < 0:
         done_idx = src.find("es.addEventListener('done'")
     assert done_idx >= 0
-    done_block = src[done_idx:done_idx+2900]
+    stream_end_idx = src.find("source.addEventListener('stream_end'", done_idx)
+    assert stream_end_idx >= 0, "stream_end listener after done handler not found"
+    done_block = src[done_idx:stream_end_idx]
     # S.busy=false must appear before renderMessages() within the done handler
     busy_pos = done_block.find("S.busy=false;")
     render_pos = done_block.find("renderMessages()")
@@ -501,8 +503,9 @@ def test_session_scoped_message_queue_frontend_wiring(cleanup_test_sessions):
     assert "const SESSION_QUEUES" in ui_src
     assert "function queueSessionMessage" in ui_src
     assert "function shiftQueuedSessionMessage" in ui_src
-    assert "const sid=S.session&&S.session.session_id;" in ui_src
-    assert "const next=sid?shiftQueuedSessionMessage(sid):null;" in ui_src
+    # _queueDrainSid tracks which session's queue to drain even after session switches
+    assert "_queueDrainSid" in ui_src
+    assert "shiftQueuedSessionMessage(sid)" in ui_src
     assert "queueSessionMessage(S.session.session_id" in messages_src
     assert "updateQueueBadge(S.session.session_id);" in messages_src
     assert "updateQueueBadge(sid);" in sessions_src
@@ -531,7 +534,8 @@ def test_reload_path_restores_pending_message_and_reattaches_live_stream(cleanup
     assert 'pending_user_message' in ui_src
     assert 'function attachLiveStream' in messages_src
     assert 'const pendingMsg=typeof getPendingSessionMessage' in sessions_src
-    assert 'const activeStreamId=data.session.active_stream_id||null;' in sessions_src
+    assert ('const activeStreamId=data.session.active_stream_id||null;' in sessions_src or
+            'const activeStreamId=S.session.active_stream_id||null;' in sessions_src)
     assert 'attachLiveStream(sid, activeStreamId' in sessions_src
     assert 'if (S.activeStreamId && S.activeStreamId === streamId) return;' in ui_src
 
@@ -661,13 +665,15 @@ def test_ui_js_keeps_reasoning_only_assistant_messages_visible(cleanup_test_sess
 
 
 def test_ui_js_does_not_hide_anchor_segments_that_contain_thinking(cleanup_test_sessions):
-    """R19c2: assistant anchor segments that contain a thinking card must remain
-    visible; only truly empty tool-call anchor segments should be hidden.
+    """R19c2/R19c3: reasoning-only messages must remain visible through the
+    shared collapsed activity dropdown, even when the anchor segment has no prose.
     """
     src = (REPO_ROOT / "static" / "ui.js").read_text()
     compact = src.replace(' ', '').replace('\n', '')
-    assert "}elseif(!thinkingText){" in compact, \
-        "renderMessages must only hide assistant anchor segments when they have no thinking content"
+    assert "assistantThinking.set(rawIdx,thinkingText)" in compact, \
+        "renderMessages must preserve reasoning text before hiding empty anchor segments"
+    assert "_thinkingActivityNode(thinkingText)" in src, \
+        "thinking-only assistant content should render inside the shared activity dropdown"
 
 
 def test_messages_js_live_assistant_segment_reuses_live_turn_wrapper(cleanup_test_sessions):

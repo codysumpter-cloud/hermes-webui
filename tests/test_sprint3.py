@@ -166,10 +166,35 @@ def test_chat_start_rejects_workspace_outside_trusted_root(tmp_path):
     assert "outside" in result.get("error", "").lower()
 
 
-def test_workspace_add_rejects_path_outside_trusted_root(tmp_path):
+def test_workspace_add_allows_external_valid_paths(tmp_path):
+    """Adding a path outside home is now allowed when the user explicitly provides it.
+    The strict trust check (resolve_trusted_workspace) is only applied when *using*
+    an existing workspace, not when registering a new one (validate_workspace_to_add)."""
     outside = tmp_path / "outside-add"
     outside.mkdir(parents=True, exist_ok=True)
     result, status = post("/api/workspaces/add", {"path": str(outside), "name": "Outside"})
+    # Explicit registration of an external path is now allowed
+    assert status == 200, f"Expected 200, got {status}: {result}"
+    # Verify it was actually saved
+    wss_result, ws_status = get("/api/workspaces")
+    paths = [w["path"] for w in wss_result.get("workspaces", [])]
+    assert str(outside.resolve()) in paths
+
+
+def test_workspace_add_rejects_system_paths():
+    """System paths (/, /etc, /sys) are always rejected even with the relaxed add validation."""
+    for path in ("/etc", "/private/etc"):
+        _, status = post("/api/workspaces/add", {"path": path, "name": "System"})
+        assert status == 400, f"{path} should be rejected"
+
+
+def test_legacy_chat_rejects_workspace_outside_trusted_root(tmp_path):
+    """Legacy /api/chat must use the same trusted workspace validation as /api/chat/start."""
+    d, _ = post("/api/session/new", {})
+    sid = d["session"]["session_id"]
+    outside = tmp_path / "outside-legacy-chat"
+    outside.mkdir(parents=True, exist_ok=True)
+    result, status = post("/api/chat", {"session_id": sid, "message": "hello", "workspace": str(outside)})
     assert status == 400
     assert "outside" in result.get("error", "").lower()
 

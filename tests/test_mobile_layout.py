@@ -147,16 +147,43 @@ def test_toggle_mobile_files_js_defined():
 def test_new_conversation_closes_mobile_sidebar():
     """New conversation must close the mobile drawer so the chat pane is visible immediately."""
     boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
-    click_line = next((ln for ln in boot_js.splitlines() if "$('btnNewChat').onclick" in ln), "")
-    assert click_line, "btnNewChat onclick handler missing from static/boot.js"
-    assert "closeMobileSidebar" in click_line, \
+    # Handler is now multi-line — search for the full block rather than a single line.
+    assert "$('btnNewChat').onclick" in boot_js, "btnNewChat onclick handler missing from static/boot.js"
+    # Find the handler block and verify closeMobileSidebar appears in it.
+    idx = boot_js.find("$('btnNewChat').onclick")
+    handler_block = boot_js[idx:idx+500]
+    assert "closeMobileSidebar" in handler_block, \
         "btnNewChat handler must closeMobileSidebar() after creating the new session"
 
     shortcut_line = next((ln for ln in boot_js.splitlines() if "e.key==='k'" in ln or "e.key === 'k'" in ln), "")
     assert shortcut_line, "Cmd/Ctrl+K new chat shortcut missing from static/boot.js"
-    shortcut_block = "\n".join(boot_js.splitlines()[boot_js.splitlines().index(shortcut_line):boot_js.splitlines().index(shortcut_line)+4])
+    shortcut_block = "\n".join(boot_js.splitlines()[boot_js.splitlines().index(shortcut_line):boot_js.splitlines().index(shortcut_line)+12])
     assert "closeMobileSidebar" in shortcut_block, \
         "Cmd/Ctrl+K new chat shortcut must closeMobileSidebar() after creating the new session"
+
+
+def test_new_conversation_shortcut_works_while_busy():
+    """Cmd/Ctrl+K should still create a new conversation while the current one is busy.
+
+    The previous behavior gated the shortcut on !S.busy, which meant users had
+    to wait for a long generation to finish before they could start something
+    new — the exact moment they want to switch context.
+    """
+    boot_js = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
+    shortcut_line = next((ln for ln in boot_js.splitlines() if "e.key==='k'" in ln or "e.key === 'k'" in ln), "")
+    assert shortcut_line, "Cmd/Ctrl+K new chat shortcut missing from static/boot.js"
+    # Inspect the next 10 lines after the keybinding match — the gating block
+    # would live there if it had been kept.
+    idx = boot_js.splitlines().index(shortcut_line)
+    shortcut_block = "\n".join(boot_js.splitlines()[idx:idx + 10])
+    # Strip the existing message-count guard (which is unrelated and stays) so
+    # we only check for an S.busy gate on the newSession() call itself.
+    assert "if(!S.busy)" not in shortcut_block, (
+        "Cmd/Ctrl+K must not be blocked by the current session's busy state"
+    )
+    assert "if (!S.busy)" not in shortcut_block, (
+        "Cmd/Ctrl+K must not be blocked by the current session's busy state"
+    )
 
 
 # ── Viewport and scroll safety ────────────────────────────────────────────────
@@ -227,6 +254,30 @@ def test_composer_textarea_font_size_mobile():
     # Check for 16px font-size on the textarea in a mobile breakpoint
     assert re.search(r'font-size:16px', CSS), \
         "Composer textarea must have font-size:16px at mobile widths to prevent iOS zoom-on-focus"
+
+
+def test_touch_device_inputs_meet_zoom_threshold():
+    """All input/textarea/select must clear iOS Safari's 16px zoom threshold
+    on touch-primary devices, not just the composer textarea (#1167).
+
+    This locks the global media-query floor so future per-element font-size
+    tweaks (sidebar search 13px, settings selects 12px, dialog inputs 14px,
+    onboarding fields 13px) cannot accidentally re-introduce auto-zoom.
+    """
+    # The hover:none + pointer:coarse pair is the canonical touch-primary
+    # detection (won't match desktop with mouse, won't match touch laptops
+    # that report hover:hover).
+    pattern = re.compile(
+        r'@media\s*\(hover:none\)\s*and\s*\(pointer:coarse\)\s*\{[^}]*'
+        r'input\s*,\s*textarea\s*,\s*select\s*\{[^}]*'
+        r'font-size:\s*max\(\s*16px',
+        re.DOTALL,
+    )
+    assert pattern.search(CSS), (
+        "style.css must contain a (hover:none) and (pointer:coarse) media "
+        "query that bumps input/textarea/select to font-size:max(16px,…) "
+        "so iOS Safari does not auto-zoom on focus (#1167)"
+    )
 
 
 

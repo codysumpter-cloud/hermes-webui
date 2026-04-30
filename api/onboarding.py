@@ -23,12 +23,14 @@ from api.config import (
     save_settings,
     verify_hermes_imports,
 )
+from api.providers import _write_env_file  # shared impl with _ENV_LOCK (#1164)
 from api.workspace import get_last_workspace, load_workspaces
 
 logger = logging.getLogger(__name__)
 
 
 _SUPPORTED_PROVIDER_SETUPS = {
+    # ── Easy start ──────────────────────────────────────────────────────
     "openrouter": {
         "label": "OpenRouter",
         "env_var": "OPENROUTER_API_KEY",
@@ -37,6 +39,8 @@ _SUPPORTED_PROVIDER_SETUPS = {
         "models": [
             {"id": model["id"], "label": model["label"]} for model in _FALLBACK_MODELS
         ],
+        "category": "easy_start",
+        "quick": True,
     },
     "anthropic": {
         "label": "Anthropic",
@@ -44,6 +48,7 @@ _SUPPORTED_PROVIDER_SETUPS = {
         "default_model": "claude-sonnet-4.6",
         "requires_base_url": False,
         "models": list(_PROVIDER_MODELS.get("anthropic", [])),
+        "category": "easy_start",
     },
     "openai": {
         "label": "OpenAI",
@@ -52,6 +57,26 @@ _SUPPORTED_PROVIDER_SETUPS = {
         "default_base_url": "https://api.openai.com/v1",
         "requires_base_url": False,
         "models": list(_PROVIDER_MODELS.get("openai", [])),
+        "category": "easy_start",
+    },
+    # ── Open / self-hosted ─────────────────────────────────────────────
+    "ollama": {
+        "label": "Ollama",
+        "env_var": "OLLAMA_API_KEY",
+        "default_model": "qwen3:32b",
+        "default_base_url": "http://localhost:11434/v1",
+        "requires_base_url": True,
+        "models": [],
+        "category": "self_hosted",
+    },
+    "lmstudio": {
+        "label": "LM Studio",
+        "env_var": "LMSTUDIO_API_KEY",
+        "default_model": "gpt-4o-mini",
+        "default_base_url": "http://localhost:1234/v1",
+        "requires_base_url": True,
+        "models": [],
+        "category": "self_hosted",
     },
     "custom": {
         "label": "Custom OpenAI-compatible",
@@ -59,8 +84,76 @@ _SUPPORTED_PROVIDER_SETUPS = {
         "default_model": "gpt-4o-mini",
         "requires_base_url": True,
         "models": [],
+        "category": "self_hosted",
+    },
+    # ── Specialized / extended ──────────────────────────────────────────
+    "gemini": {
+        "label": "Google Gemini",
+        "env_var": "GOOGLE_API_KEY",
+        "default_model": "gemini-3.1-pro-preview",
+        "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "requires_base_url": False,
+        # _PROVIDER_MODELS in api/config.py is keyed under "google" even though
+        # the agent's alias map normalizes "google" → "gemini".  Use the catalog
+        # key here so the wizard surfaces the actual model list.
+        "models": list(_PROVIDER_MODELS.get("google", [])),
+        "category": "specialized",
+    },
+    "deepseek": {
+        "label": "DeepSeek",
+        "env_var": "DEEPSEEK_API_KEY",
+        "default_model": "deepseek-v4-flash",
+        "default_base_url": "https://api.deepseek.com",
+        "requires_base_url": False,
+        "models": list(_PROVIDER_MODELS.get("deepseek", [])),
+        "category": "specialized",
+    },
+    "zai": {
+        "label": "Z.AI / GLM (智谱)",
+        "env_var": "GLM_API_KEY",
+        "default_model": "glm-5.1",
+        "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "requires_base_url": False,
+        "models": list(_PROVIDER_MODELS.get("zai", [])),
+        "category": "specialized",
+    },
+    "nvidia": {
+        "label": "NVIDIA NIM",
+        "env_var": "NVIDIA_API_KEY",
+        "default_model": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "default_base_url": "https://integrate.api.nvidia.com/v1",
+        "requires_base_url": False,
+        "models": list(_PROVIDER_MODELS.get("nvidia", [])),
+        "category": "specialized",
+    },
+    "mistralai": {
+        "label": "Mistral",
+        "env_var": "MISTRAL_API_KEY",
+        "default_model": "mistral-large-latest",
+        "default_base_url": "https://api.mistral.ai/v1",
+        "requires_base_url": False,
+        # No catalog entry for mistralai today — wizard shows a free-text input.
+        "models": list(_PROVIDER_MODELS.get("mistralai", [])),
+        "category": "specialized",
+    },
+    "x-ai": {
+        "label": "xAI (Grok)",
+        "env_var": "XAI_API_KEY",
+        "default_model": "grok-4.20",
+        "default_base_url": "https://api.x.ai/v1",
+        "requires_base_url": False,
+        # Agent normalizes "x-ai" → "xai"; _PROVIDER_MODELS is also keyed "xai"
+        # when populated, so check both keys for forward-compatibility.
+        "models": list(_PROVIDER_MODELS.get("xai", []) or _PROVIDER_MODELS.get("x-ai", [])),
+        "category": "specialized",
     },
 }
+
+_PROVIDER_CATEGORIES = [
+    {"id": "easy_start", "label": "Easy start", "order": 0},
+    {"id": "self_hosted", "label": "Open / self-hosted", "order": 1},
+    {"id": "specialized", "label": "Specialized", "order": 2},
+]
 
 _UNSUPPORTED_PROVIDER_NOTE = (
     "OAuth and advanced provider flows such as Nous Portal, OpenAI Codex, and GitHub "
@@ -92,26 +185,6 @@ def _load_env_file(env_path: Path) -> dict[str, str]:
         return {}
     return values
 
-
-def _write_env_file(env_path: Path, updates: dict[str, str]) -> None:
-    current = _load_env_file(env_path)
-    for key, value in updates.items():
-        if value is None:
-            current.pop(key, None)
-            os.environ.pop(key, None)
-            continue
-        clean = str(value).strip()
-        if not clean:
-            continue
-        # Reject embedded newlines/carriage returns to prevent .env injection
-        if "\n" in clean or "\r" in clean:
-            raise ValueError("API key must not contain newline characters.")
-        current[key] = clean
-        os.environ[key] = clean
-
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{key}={current[key]}" for key in sorted(current)]
-    env_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def _load_yaml_config(config_path: Path) -> dict:
@@ -384,9 +457,23 @@ def _build_setup_catalog(cfg: dict) -> dict:
                 "default_base_url": meta.get("default_base_url") or "",
                 "requires_base_url": bool(meta.get("requires_base_url")),
                 "models": list(meta.get("models", [])),
-                "quick": provider_id == "openrouter",
+                "category": meta.get("category", "easy_start"),
+                "quick": meta.get("quick", False),
             }
         )
+
+    # Sort providers by category order, then alphabetically within each category.
+    cat_order = {c["id"]: c["order"] for c in _PROVIDER_CATEGORIES}
+    providers.sort(key=lambda p: (cat_order.get(p["category"], 99), p["label"]))
+
+    # Group providers by category for the frontend.
+    categories = []
+    for cat in sorted(_PROVIDER_CATEGORIES, key=lambda c: c["order"]):
+        categories.append({
+            "id": cat["id"],
+            "label": cat["label"],
+            "providers": [p["id"] for p in providers if p["category"] == cat["id"]],
+        })
 
     # Flag whether the currently-configured provider is OAuth-based (not in the
     # API-key flow).  The frontend uses this to show a confirmation card instead
@@ -397,6 +484,7 @@ def _build_setup_catalog(cfg: dict) -> dict:
 
     return {
         "providers": providers,
+        "categories": categories,
         "unsupported_note": _UNSUPPORTED_PROVIDER_NOTE,
         "current_is_oauth": current_is_oauth,
         "current": {
@@ -429,11 +517,52 @@ def get_onboarding_status() -> dict:
     auto_completed = skip_requested  # unconditional: operator says skip, we skip
 
     # Auto-complete for existing Hermes users: if config.yaml already exists
-    # AND the system is chat_ready, treat onboarding as done.  These users
-    # configured Hermes via the CLI before the Web UI existed; they must never
-    # be shown the first-run wizard — it would silently overwrite their config.
+    # AND the provider is configured (or the system is chat_ready), treat onboarding
+    # as done.  These users configured Hermes via the CLI before the Web UI existed;
+    # they must never be shown the first-run wizard — it would silently overwrite their
+    # config.  We use provider_configured (not chat_ready) so that users with
+    # non-wizard providers (ollama-cloud, deepseek, xai, kimi, etc.) are not forced
+    # through the wizard just because their provider doesn't have a detectable API key
+    # — the wizard cannot represent their provider and would overwrite their config
+    # with whichever wizard-supported provider they accidentally select.
     config_exists = Path(_get_config_path()).exists()
-    config_auto_completed = config_exists and bool(runtime.get("chat_ready"))
+
+    # For providers not in the wizard's quick-setup list (e.g. ollama-cloud, deepseek,
+    # xai, kimi-k2.6), the wizard can never help — it only knows how to configure
+    # openrouter/anthropic/openai/google/custom.  If such a user has a configured
+    # provider + model in config.yaml, showing the wizard would only confuse them
+    # (or worse, let them accidentally overwrite their config with gpt-5.4-mini).
+    _current_provider = str(
+        (cfg.get("model", {}) or {}).get("provider", "") if isinstance(cfg.get("model"), dict)
+        else ""
+    ).strip().lower()
+    _is_non_wizard_provider = bool(
+        _current_provider and _current_provider not in _SUPPORTED_PROVIDER_SETUPS
+    )
+
+    config_auto_completed = config_exists and (
+        bool(runtime.get("chat_ready"))
+        or (_is_non_wizard_provider and bool(runtime.get("provider_configured")))
+    )
+
+    # Persist the flag so it survives future transient import failures (e.g. after
+    # a git branch switch in the hermes-agent repo).  Without this, a CLI-configured
+    # user who never ran the wizard has no onboarding_completed flag — any momentary
+    # imports_ok=False during restart makes chat_ready=False, config_auto_completed=False,
+    # and the wizard reappears with a broken dropdown that clobbers their config.
+    #
+    # Best-effort: if save_settings raises (read-only FS, disk full, permission error),
+    # log and continue.  The `config_auto_completed` branch of `completed=` below still
+    # returns True for this request, so the user sees the correct state — only the
+    # persistence-across-restart guarantee is degraded.  Raising here would turn every
+    # /api/onboarding/status call into a 500 until disk was writable, which is worse UX
+    # than losing the next-restart protection.
+    if config_auto_completed and not settings.get("onboarding_completed"):
+        try:
+            save_settings({"onboarding_completed": True})
+            settings["onboarding_completed"] = True
+        except Exception:
+            logger.debug("Failed to persist onboarding_completed", exc_info=True)
 
     return {
         "completed": bool(settings.get("onboarding_completed")) or auto_completed or config_auto_completed,
@@ -523,12 +652,10 @@ def apply_onboarding_setup(body: dict) -> dict:
     model_cfg["provider"] = provider
     model_cfg["default"] = _normalize_model_for_provider(provider, model)
 
-    if provider == "custom":
+    if provider_meta.get("requires_base_url"):
         model_cfg["base_url"] = base_url
-    elif provider == "openai":
-        model_cfg["base_url"] = (
-            provider_meta.get("default_base_url") or "https://api.openai.com/v1"
-        )
+    elif provider_meta.get("default_base_url"):
+        model_cfg["base_url"] = provider_meta["default_base_url"]
     else:
         model_cfg.pop("base_url", None)
 

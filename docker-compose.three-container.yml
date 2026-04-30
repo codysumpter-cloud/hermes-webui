@@ -13,6 +13,12 @@
 #
 # All three share the same hermes-home volume so config, sessions,
 # skills, and memory are consistent across all surfaces.
+#
+# NOTE ON VOLUMES:
+#   This file uses named Docker volumes (hermes-home, hermes-agent-src) which
+#   work out of the box. If you prefer bind mounts (e.g. to an existing directory),
+#   see the two-container compose file for a bind-mount example.
+#   When using bind mounts, ALL containers must mount the same host path.
 
 services:
   hermes-agent:
@@ -23,11 +29,11 @@ services:
       - "127.0.0.1:8642:8642"
     volumes:
       # Persist config, state, sessions, skills, memory across restarts
-      - hermes-home:/root/.hermes
+      - hermes-home:/home/hermes/.hermes
       # Expose agent source so the WebUI can install dependencies from it
       - hermes-agent-src:/opt/hermes
     environment:
-      - HERMES_HOME=/root/.hermes
+      - HERMES_HOME=/home/hermes/.hermes
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
     restart: unless-stopped
@@ -46,9 +52,9 @@ services:
     ports:
       - "127.0.0.1:9119:9119"
     volumes:
-      - hermes-home:/root/.hermes
+      - hermes-home:/home/hermes/.hermes
     environment:
-      - HERMES_HOME=/root/.hermes
+      - HERMES_HOME=/home/hermes/.hermes
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
       # Dashboard connects to the gateway for health/session data
