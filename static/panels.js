@@ -1430,15 +1430,22 @@ function syncWorkspaceDisplays(){
 
   const composerChip=$('composerWorkspaceChip');
   const composerLabel=$('composerWorkspaceLabel');
+  const mobileAction=$('composerMobileWorkspaceAction');
+  const mobileLabel=$('composerMobileWorkspaceLabel');
   const composerDropdown=$('composerWsDropdown');
   if(!hasWorkspace && composerDropdown) composerDropdown.classList.remove('open');
   // Only show workspace label once boot has finished to prevent
   // flash of "No workspace" before the saved session finishes loading.
   if(composerLabel) composerLabel.textContent=S._bootReady?label:'';
+  if(mobileLabel) mobileLabel.textContent=S._bootReady?label:'';
   if(composerChip){
     composerChip.disabled=!hasWorkspace;
     composerChip.title=hasWorkspace?ws:t('no_workspace');
     composerChip.classList.toggle('active',!!(composerDropdown&&composerDropdown.classList.contains('open')));
+  }
+  if(mobileAction){
+    mobileAction.title=hasWorkspace?ws:t('no_workspace');
+    mobileAction.classList.toggle('active',!!(composerDropdown&&composerDropdown.classList.contains('open')));
   }
 }
 
@@ -1462,9 +1469,13 @@ function _renderWorkspaceAction(label, meta, iconSvg, onClick){
 function _positionComposerWsDropdown(){
   const dd=$('composerWsDropdown');
   const chip=$('composerWorkspaceGroup')||$('composerWorkspaceChip');
+  const mobileAction=$('composerMobileWorkspaceAction');
+  const panel=$('composerMobileConfigPanel');
   const footer=document.querySelector('.composer-footer');
-  if(!dd||!chip||!footer)return;
-  const chipRect=chip.getBoundingClientRect();
+  // While the mobile config panel is open, anchor to #composerMobileWorkspaceAction instead of only the desktop workspace chip.
+  const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
+  if(!dd||!anchor||!footer)return;
+  const chipRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
   let left=chipRect.left-footerRect.left;
   const maxLeft=Math.max(0, footer.clientWidth-dd.offsetWidth);
@@ -1528,17 +1539,22 @@ function toggleWsDropdown(){
 function toggleComposerWsDropdown(){
   const dd=$('composerWsDropdown');
   const chip=$('composerWorkspaceChip');
-  if(!dd||!chip||chip.disabled)return;
+  const mobileAction=$('composerMobileWorkspaceAction');
+  const panel=$('composerMobileConfigPanel');
+  const usingMobileAction=!!(panel&&panel.classList.contains('open')&&mobileAction);
+  if(!dd||(!usingMobileAction&&(!chip||chip.disabled)))return;
   const open=dd.classList.contains('open');
   if(open){closeWsDropdown();}
   else{
     closeProfileDropdown();
     if(typeof closeModelDropdown==='function') closeModelDropdown();
+    if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
     loadWorkspaceList().then(data=>{
       renderWorkspaceDropdownInto(dd, data.workspaces, S.session?S.session.workspace:'');
       dd.classList.add('open');
       _positionComposerWsDropdown();
-      chip.classList.add('active');
+      if(chip) chip.classList.add('active');
+      if(mobileAction) mobileAction.classList.add('active');
     });
   }
 }
@@ -1547,13 +1563,16 @@ function closeWsDropdown(){
   const dd=$('wsDropdown');
   const composerDd=$('composerWsDropdown');
   const composerChip=$('composerWorkspaceChip');
+  const mobileAction=$('composerMobileWorkspaceAction');
   if(dd)dd.classList.remove('open');
   if(composerDd)composerDd.classList.remove('open');
   if(composerChip)composerChip.classList.remove('active');
+  if(mobileAction)mobileAction.classList.remove('active');
 }
 document.addEventListener('click',e=>{
   if(
     !e.target.closest('#composerWorkspaceChip') &&
+    !e.target.closest('#composerMobileWorkspaceAction') &&
     !e.target.closest('#composerWsDropdown')
   ) closeWsDropdown();
 });
@@ -2244,7 +2263,7 @@ async function switchToProfile(name) {
     // ── Apply model ────────────────────────────────────────────────────────
     if (data.default_model) {
       const sel = $('modelSelect');
-      const resolved = _applyModelToDropdown(data.default_model, sel);
+      const resolved = _applyModelToDropdown(data.default_model, sel, window._activeProvider||null);
       const modelToUse = resolved || data.default_model;
       S._pendingProfileModel = modelToUse;
       // Only patch the in-memory session model if we're NOT about to replace the session
@@ -2492,6 +2511,8 @@ let _settingsSection = 'conversation';
 let _currentSettingsSection = 'conversation';
 let _settingsAppearanceAutosaveTimer = null;
 let _settingsAppearanceAutosaveRetryPayload = null;
+let _settingsPreferencesAutosaveTimer = null;
+let _settingsPreferencesAutosaveRetryPayload = null;
 
 function switchSettingsSection(name){
   const section=(name==='appearance'||name==='preferences'||name==='providers'||name==='system')?name:'conversation';
@@ -2675,6 +2696,105 @@ function _retryAppearanceAutosave(){
   _autosaveAppearanceSettings(payload);
 }
 
+// ── Phase 2: Preferences autosave (Issue #1003) ───────────────────────
+
+function _preferencesPayloadFromUi(){
+  const payload={};
+  const sendKeySel=$('settingsSendKey');
+  if(sendKeySel) payload.send_key=sendKeySel.value;
+  const langSel=$('settingsLanguage');
+  if(langSel) payload.language=langSel.value;
+  const showUsageCb=$('settingsShowTokenUsage');
+  if(showUsageCb) payload.show_token_usage=showUsageCb.checked;
+  const simplifiedToolCb=$('settingsSimplifiedToolCalling');
+  if(simplifiedToolCb) payload.simplified_tool_calling=simplifiedToolCb.checked;
+  const showCliCb=$('settingsShowCliSessions');
+  if(showCliCb) payload.show_cli_sessions=showCliCb.checked;
+  const syncCb=$('settingsSyncInsights');
+  if(syncCb) payload.sync_to_insights=syncCb.checked;
+  const updateCb=$('settingsCheckUpdates');
+  if(updateCb) payload.check_for_updates=updateCb.checked;
+  const soundCb=$('settingsSoundEnabled');
+  if(soundCb) payload.sound_enabled=soundCb.checked;
+  const notifCb=$('settingsNotificationsEnabled');
+  if(notifCb) payload.notifications_enabled=notifCb.checked;
+  const sidebarDensitySel=$('settingsSidebarDensity');
+  if(sidebarDensitySel) payload.sidebar_density=sidebarDensitySel.value;
+  const autoTitleRefreshSel=$('settingsAutoTitleRefresh');
+  if(autoTitleRefreshSel) payload.auto_title_refresh_every=parseInt(autoTitleRefreshSel.value,10);
+  const busyInputModeSel=$('settingsBusyInputMode');
+  if(busyInputModeSel) payload.busy_input_mode=busyInputModeSel.value;
+  const botNameField=$('settingsBotName');
+  if(botNameField) payload.bot_name=botNameField.value;
+  return payload;
+}
+
+function _setPreferencesAutosaveStatus(state){
+  const el=$('settingsPreferencesAutosaveStatus');
+  if(!el) return;
+  el.className='settings-autosave-status';
+  if(!state){
+    el.textContent='';
+    return;
+  }
+  el.classList.add('is-'+state);
+  if(state==='saving'){
+    el.textContent=t('settings_autosave_saving');
+  }else if(state==='saved'){
+    el.textContent=t('settings_autosave_saved');
+  }else if(state==='failed'){
+    el.innerHTML=`<span>${esc(t('settings_autosave_failed'))}</span> <button type=\"button\" onclick=\"_retryPreferencesAutosave()\">${esc(t('settings_autosave_retry'))}</button>`;
+  }
+}
+
+function _rememberPreferencesSaved(payload){
+  if(!payload) return;
+  if(payload.send_key!==undefined) localStorage.setItem('hermes-pref-send_key',payload.send_key);
+  if(payload.language!==undefined) localStorage.setItem('hermes-pref-language',payload.language);
+}
+
+function _schedulePreferencesAutosave(){
+  const payload=_preferencesPayloadFromUi();
+  _rememberPreferencesSaved(payload);
+  _settingsPreferencesAutosaveRetryPayload=payload;
+  _setPreferencesAutosaveStatus('saving');
+  if(_settingsPreferencesAutosaveTimer) clearTimeout(_settingsPreferencesAutosaveTimer);
+  _settingsPreferencesAutosaveTimer=setTimeout(()=>_autosavePreferencesSettings(payload),350);
+}
+
+async function _autosavePreferencesSettings(payload){
+  try{
+    await api('/api/settings',{method:'POST',body:JSON.stringify(payload)});
+    _settingsPreferencesAutosaveRetryPayload=null;
+    _setPreferencesAutosaveStatus('saved');
+    // Only clear the global dirty flag and hide the unsaved-changes bar when
+    // there is no pending edit on a manually-saved field. Password and model
+    // are still committed via the explicit "Save Settings" button (password
+    // for security; model goes through /api/default-model). Without this
+    // guard, autosaving a checkbox right after a user typed in the password
+    // field would silently dismiss the password edit. (Opus pre-release
+    // review of v0.50.250, SHOULD-FIX Q1.)
+    const pwField=$('settingsPassword');
+    const pwDirty=!!(pwField&&pwField.value);
+    const modelSel=$('settingsModel');
+    const modelDirty=!!(modelSel&&((modelSel.value||'')!==(_settingsHermesDefaultModelOnOpen||'')));
+    if(!pwDirty&&!modelDirty){
+      _settingsDirty=false;
+      const bar=$('settingsUnsavedBar');
+      if(bar) bar.style.display='none';
+    }
+  }catch(e){
+    console.warn('[settings] preferences autosave failed', e);
+    _setPreferencesAutosaveStatus('failed');
+  }
+}
+
+function _retryPreferencesAutosave(){
+  const payload=_settingsPreferencesAutosaveRetryPayload||_preferencesPayloadFromUi();
+  _setPreferencesAutosaveStatus('saving');
+  _autosavePreferencesSettings(payload);
+}
+
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
@@ -2753,7 +2873,7 @@ async function loadSettingsPanel(){
       // picker renders blank for any user whose default was persisted without the
       // @-prefix — CLI-first users, legacy installs, etc.
       if(typeof _applyModelToDropdown==='function'){
-        _applyModelToDropdown(_settingsHermesDefaultModelOnOpen, modelSel);
+        _applyModelToDropdown(_settingsHermesDefaultModelOnOpen, modelSel, (models&&models.active_provider)||window._activeProvider||null);
       }else{
         modelSel.value=_settingsHermesDefaultModelOnOpen;
       }
@@ -2761,7 +2881,7 @@ async function loadSettingsPanel(){
     }
     // Send key preference
     const sendKeySel=$('settingsSendKey');
-    if(sendKeySel){sendKeySel.value=settings.send_key||'enter';sendKeySel.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(sendKeySel){sendKeySel.value=settings.send_key||'enter';sendKeySel.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     // Language preference — populate from LOCALES bundle
     const langSel=$('settingsLanguage');
     if(langSel){
@@ -2774,20 +2894,20 @@ async function loadSettingsPanel(){
         }
       }
       langSel.value=resolvedLanguage;
-      langSel.addEventListener('change',_markSettingsDirty,{once:false});
+      langSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     const showUsageCb=$('settingsShowTokenUsage');
-    if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(showUsageCb){showUsageCb.checked=!!settings.show_token_usage;showUsageCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const simplifiedToolCb=$('settingsSimplifiedToolCalling');
-    if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(simplifiedToolCb){simplifiedToolCb.checked=settings.simplified_tool_calling!==false;simplifiedToolCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
-    if(showCliCb){showCliCb.checked=!!settings.show_cli_sessions;showCliCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(showCliCb){showCliCb.checked=!!settings.show_cli_sessions;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const syncCb=$('settingsSyncInsights');
-    if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(syncCb){syncCb.checked=!!settings.sync_to_insights;syncCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const updateCb=$('settingsCheckUpdates');
-    if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(updateCb){updateCb.checked=settings.check_for_updates!==false;updateCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const soundCb=$('settingsSoundEnabled');
-    if(soundCb){soundCb.checked=!!settings.sound_enabled;soundCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(soundCb){soundCb.checked=!!settings.sound_enabled;soundCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     // TTS settings (localStorage-only, no server round-trip needed)
     const ttsEnabledCb=$('settingsTtsEnabled');
     if(ttsEnabledCb){ttsEnabledCb.checked=localStorage.getItem('hermes-tts-enabled')==='true';ttsEnabledCb.onchange=function(){localStorage.setItem('hermes-tts-enabled',this.checked?'true':'false');_applyTtsEnabled(this.checked);};}
@@ -2829,29 +2949,36 @@ async function loadSettingsPanel(){
       ttsPitchSlider.oninput=function(){if(ttsPitchValue)ttsPitchValue.textContent=parseFloat(this.value).toFixed(1);localStorage.setItem('hermes-tts-pitch',this.value);};
     }
     const notifCb=$('settingsNotificationsEnabled');
-    if(notifCb){notifCb.checked=!!settings.notifications_enabled;notifCb.addEventListener('change',_markSettingsDirty,{once:false});}
+    if(notifCb){notifCb.checked=!!settings.notifications_enabled;notifCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     // show_thinking has no settings panel checkbox — controlled via /reasoning show|hide
     const sidebarDensitySel=$('settingsSidebarDensity');
     if(sidebarDensitySel){
       sidebarDensitySel.value=settings.sidebar_density==='detailed'?'detailed':'compact';
-      sidebarDensitySel.addEventListener('change',_markSettingsDirty,{once:false});
+      sidebarDensitySel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     const autoTitleRefreshSel=$('settingsAutoTitleRefresh');
     if(autoTitleRefreshSel){
       const val=String(settings.auto_title_refresh_every||'0');
       autoTitleRefreshSel.value=['0','5','10','20'].includes(val)?val:'0';
-      autoTitleRefreshSel.addEventListener('change',_markSettingsDirty,{once:false});
+      autoTitleRefreshSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
     // Busy input mode
     const busyInputModeSel=$('settingsBusyInputMode');
     if(busyInputModeSel){
       const val=String(settings.busy_input_mode||'queue');
       busyInputModeSel.value=['queue','interrupt','steer'].includes(val)?val:'queue';
-      busyInputModeSel.addEventListener('change',_markSettingsDirty,{once:false});
+      busyInputModeSel.addEventListener('change',_schedulePreferencesAutosave,{once:false});
     }
-    // Bot name
+    // Bot name — debounced autosave (text input)
     const botNameField=$('settingsBotName');
-    if(botNameField){botNameField.value=settings.bot_name||'Hermes';botNameField.addEventListener('input',_markSettingsDirty,{once:false});}
+    if(botNameField){
+      botNameField.value=settings.bot_name||'Hermes';
+      let botNameTimer=null;
+      botNameField.addEventListener('input',()=>{
+        if(botNameTimer) clearTimeout(botNameTimer);
+        botNameTimer=setTimeout(_schedulePreferencesAutosave,500);
+      },{once:false});
+    }
     // Password field: always blank (we don't send hash back)
     const pwField=$('settingsPassword');
     if(pwField){pwField.value='';pwField.addEventListener('input',_markSettingsDirty,{once:false});}

@@ -4,6 +4,7 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 """
 
 import html as _html
+import copy
 import json
 import logging
 import os
@@ -94,10 +95,29 @@ def _cron_output_content_window(text: str, limit: int = _CRON_OUTPUT_CONTENT_LIM
 
 def _run_cron_tracked(job):
     """Wrapper that tracks running state around cron.scheduler.run_job."""
+    from cron.scheduler import run_job  # import here — runs inside a worker thread
+    from cron.jobs import mark_job_run, save_job_output
+
+    job_id = job.get("id", "")
     try:
-        run_job(job)
+        success, output, final_response, error = run_job(job)
+        save_job_output(job_id, output)
+
+        # Match the scheduled cron path: an apparently successful run with no
+        # final response should not leave the job looking healthy.
+        if success and not final_response:
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        mark_job_run(job_id, success, error)
+    except Exception as e:
+        logger.exception("Manual cron run failed for job %s", job_id)
+        try:
+            mark_job_run(job_id, False, str(e))
+        except Exception:
+            logger.debug("Failed to mark manual cron run failure for %s", job_id)
     finally:
-        _mark_cron_done(job.get("id", ""))
+        _mark_cron_done(job_id)
 
 _PROVIDER_ALIASES = {
     "claude": "anthropic",
@@ -124,9 +144,49 @@ _OPENAI_COMPAT_ENDPOINTS = {
 # the openai provider is already wired through provider_model_ids(); codex-
 # specific model filtering happens downstream in hermes_cli.
 #
-# TODO: Add TTL-based caching (e.g. 60s) so repeated model-list requests
-# don't hit provider APIs.  The frontend already caches via _liveModelCache
-# but the backend re-fetches on every /api/models/live call.
+_LIVE_MODELS_CACHE_TTL = 60.0
+_LIVE_MODELS_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_LIVE_MODELS_CACHE_LOCK = threading.RLock()
+
+
+def _active_profile_for_live_models_cache() -> str:
+    try:
+        from api.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "default"
+    except Exception as _e:
+        # A transient profile-resolution error mis-scopes the cache for up to
+        # 60s ("default" gets the wrong payload). Log so we can detect it; the
+        # blast radius stays small because the TTL caps the bad-cache window.
+        logger.debug("_active_profile_for_live_models_cache fell back to 'default': %s", _e)
+        return "default"
+
+
+def _live_models_cache_key(provider: str) -> tuple[str, str]:
+    return (_active_profile_for_live_models_cache(), provider)
+
+
+def _get_cached_live_models(key: tuple[str, str]) -> dict | None:
+    now = time.monotonic()
+    with _LIVE_MODELS_CACHE_LOCK:
+        cached = _LIVE_MODELS_CACHE.get(key)
+        if not cached:
+            return None
+        ts, payload = cached
+        if now - ts >= _LIVE_MODELS_CACHE_TTL:
+            _LIVE_MODELS_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(payload)
+
+
+def _set_cached_live_models(key: tuple[str, str], payload: dict) -> None:
+    with _LIVE_MODELS_CACHE_LOCK:
+        _LIVE_MODELS_CACHE[key] = (time.monotonic(), copy.deepcopy(payload))
+
+
+def _clear_live_models_cache() -> None:
+    with _LIVE_MODELS_CACHE_LOCK:
+        _LIVE_MODELS_CACHE.clear()
 
 from api.config import (
     STATE_DIR,
@@ -487,6 +547,8 @@ from api.models import (
     import_cli_session,
     get_cli_sessions,
     get_cli_session_messages,
+    ensure_cron_project,
+    is_cron_session,
 )
 from api.workspace import (
     load_workspaces,
@@ -542,6 +604,67 @@ except ImportError:
     _permanent_approved = set()
 
 
+# ── Approval SSE subscribers (long-connection push) ──────────────────────────
+_approval_sse_subscribers: dict[str, list[queue.Queue]] = {}
+
+
+def _approval_sse_subscribe(session_id: str) -> queue.Queue:
+    """Register an SSE subscriber for approval events on a given session."""
+    q = queue.Queue(maxsize=16)
+    with _lock:
+        _approval_sse_subscribers.setdefault(session_id, []).append(q)
+    return q
+
+
+def _approval_sse_unsubscribe(session_id: str, q: queue.Queue) -> None:
+    """Remove an SSE subscriber."""
+    with _lock:
+        subs = _approval_sse_subscribers.get(session_id)
+        if subs and q in subs:
+            subs.remove(q)
+            if not subs:
+                _approval_sse_subscribers.pop(session_id, None)
+
+
+def _approval_sse_notify_locked(session_id: str, head: dict | None, total: int) -> None:
+    """Push an approval event to all SSE subscribers for a session.
+
+    CALLER MUST HOLD `_lock`. Snapshots the subscriber list under the held
+    lock and then calls `q.put_nowait()` on each (which is itself thread-safe).
+
+    `head` is the approval entry currently at the head of the queue (the one
+    the UI should display) — NOT the just-appended entry. With multiple
+    parallel approvals (#527), the just-appended entry is at the TAIL, but
+    `/api/approval/pending` always returns the HEAD, so SSE must match.
+
+    `total` is the total number of pending approvals.
+
+    Pass `head=None` and `total=0` when the queue has just been emptied (e.g.
+    `_handle_approval_respond` popped the last entry) so the client knows to
+    hide its approval card.
+    """
+    payload = {"pending": dict(head) if head else None, "pending_count": total}
+    subs = _approval_sse_subscribers.get(session_id, ())
+    for q in subs:
+        try:
+            q.put_nowait(payload)
+        except queue.Full:
+            pass  # drop if subscriber is slow (bounded queue prevents memory leak)
+
+
+def _approval_sse_notify(session_id: str, head: dict | None, total: int) -> None:
+    """Convenience wrapper that takes `_lock` itself.
+
+    Use only from contexts that don't already hold `_lock`. Production call
+    sites (submit_pending, _handle_approval_respond) MUST hold the lock and
+    call `_approval_sse_notify_locked` directly to avoid a notify-ordering
+    race where a later append's notify can fire before an earlier append's
+    notify (resulting in stale `pending_count`).
+    """
+    with _lock:
+        _approval_sse_notify_locked(session_id, head, total)
+
+
 def submit_pending(session_key: str, approval: dict) -> None:
     """Append a pending approval to the per-session queue.
 
@@ -550,16 +673,23 @@ def submit_pending(session_key: str, approval: dict) -> None:
       a specific entry even when multiple approvals are queued simultaneously.
     - Change the storage from a single overwriting dict value to a list, so
       parallel tool calls each get their own approval slot (fixes #527).
+    - Notify any connected SSE subscribers immediately.
     """
     entry = dict(approval)
     entry.setdefault("approval_id", uuid.uuid4().hex)
     with _lock:
-        queue = _pending.setdefault(session_key, [])
+        queue_list = _pending.setdefault(session_key, [])
         # Replace a legacy non-list value if the agent version uses the old pattern.
-        if not isinstance(queue, list):
-            _pending[session_key] = [queue]
-            queue = _pending[session_key]
-        queue.append(entry)
+        if not isinstance(queue_list, list):
+            _pending[session_key] = [queue_list]
+            queue_list = _pending[session_key]
+        queue_list.append(entry)
+        total = len(queue_list)
+        head = queue_list[0]  # /api/approval/pending always returns head
+        # Push to SSE subscribers from inside _lock so two parallel
+        # submit_pending calls can't deliver out-of-order (T2's later
+        # notify arriving before T1's earlier notify with a stale count).
+        _approval_sse_notify_locked(session_key, head, total)
     # NOTE: We do NOT call _submit_pending_raw here — that function overwrites
     # _pending[session_key] with a single dict, which would undo the list we just
     # built. The gateway blocking path uses _gateway_queues (a separate mechanism
@@ -572,10 +702,13 @@ try:
         submit_pending as submit_clarify_pending,
         get_pending as get_clarify_pending,
         resolve_clarify,
+        sse_subscribe as clarify_sse_subscribe,
+        sse_unsubscribe as clarify_sse_unsubscribe,
     )
 except ImportError:
     submit_clarify_pending = lambda *a, **k: None
     get_clarify_pending = lambda *a, **k: None
+    clarify_sse_subscribe = None
     resolve_clarify = lambda *a, **k: 0
 
 
@@ -716,9 +849,12 @@ def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
     if parsed.path in ("/", "/index.html"):
+        from urllib.parse import quote
+        from api.updates import WEBUI_VERSION
+        version_token = quote(WEBUI_VERSION, safe="")
         return t(
             handler,
-            _INDEX_HTML_PATH.read_text(encoding="utf-8"),
+            _INDEX_HTML_PATH.read_text(encoding="utf-8").replace("__WEBUI_VERSION__", version_token),
             content_type="text/html; charset=utf-8",
         )
 
@@ -775,9 +911,11 @@ def handle_get(handler, parsed) -> bool:
         if sw_path.exists():
             # Inject the current git-derived version as the cache name so the
             # service worker cache busts automatically on every new deploy.
+            from urllib.parse import quote
             from api.updates import WEBUI_VERSION
+            version_token = quote(WEBUI_VERSION, safe="")
             text = sw_path.read_text(encoding="utf-8").replace(
-                "__CACHE_VERSION__", WEBUI_VERSION
+                "__CACHE_VERSION__", version_token
             )
             data = text.encode("utf-8")
             handler.send_response(200)
@@ -920,6 +1058,9 @@ def handle_get(handler, parsed) -> bool:
                 "pending_user_message": getattr(s, "pending_user_message", None),
                 "pending_attachments": getattr(s, "pending_attachments", []) if load_messages else [],
                 "pending_started_at": getattr(s, "pending_started_at", None),
+                "context_length": getattr(s, "context_length", 0) or 0,
+                "threshold_tokens": getattr(s, "threshold_tokens", 0) or 0,
+                "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
             }
             # Signal to the frontend that older messages were omitted.
             # For msg_before paging, compare against the filtered set,
@@ -1180,6 +1321,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/approval/pending":
         return _handle_approval_pending(handler, parsed)
 
+    if parsed.path == "/api/approval/stream":
+        return _handle_approval_sse_stream(handler, parsed)
+
     if parsed.path == "/api/approval/inject_test":
         # Loopback-only: used by automated tests; blocked from any remote client
         if handler.client_address[0] != "127.0.0.1":
@@ -1188,6 +1332,9 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/clarify/pending":
         return _handle_clarify_pending(handler, parsed)
+
+    if parsed.path == "/api/clarify/stream":
+        return _handle_clarify_sse_stream(handler, parsed)
 
     if parsed.path == "/api/clarify/inject_test":
         # Loopback-only: used by automated tests; blocked from any remote client
@@ -1554,6 +1701,81 @@ def handle_post(handler, parsed) -> bool:
         return j(
             handler, {"ok": True, "session": s.compact() | {"messages": s.messages}}
         )
+
+    if parsed.path == "/api/session/branch":
+        # Fork a conversation from any message point (#465).
+        # Accepts: {session_id, keep_count?, title?}
+        #   keep_count: number of messages to copy (0=empty, undefined=full history)
+        #   title: custom title (defaults to "<original title> (fork)")
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        # Reject non-string session_id explicitly so the failure surfaces as a
+        # 400 instead of a generic 500 from get_session() raising TypeError.
+        # (Opus pre-release follow-up.)
+        if not isinstance(body["session_id"], str):
+            return bad(handler, "session_id must be a string")
+        try:
+            source = get_session(body["session_id"])
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+
+        keep_count = body.get("keep_count")
+        if keep_count is not None:
+            try:
+                keep_count = int(keep_count)
+            except (ValueError, TypeError):
+                return bad(handler, "keep_count must be an integer")
+            # Negative slice (`messages[:-N]`) returns "all but last N", which
+            # is a confusing fork semantic. Reject explicitly so the user
+            # doesn't accidentally fork a session with the tail truncated when
+            # they meant to copy the prefix. (Opus pre-release follow-up.)
+            if keep_count < 0:
+                return bad(handler, "keep_count must be non-negative")
+
+        custom_title = body.get("title")
+        if custom_title:
+            custom_title = str(custom_title).strip()[:80] or None
+
+        # Build messages slice
+        source_messages = source.messages or []
+        if keep_count is not None:
+            forked_messages = source_messages[:keep_count]
+        else:
+            forked_messages = list(source_messages)
+
+        # Derive title
+        if custom_title:
+            branch_title = custom_title
+        else:
+            source_title = source.title or "Untitled"
+            branch_title = f"{source_title} (fork)"
+
+        # Create new session inheriting workspace/model/profile
+        branch = Session(
+            workspace=source.workspace,
+            model=source.model,
+            profile=getattr(source, "profile", None),
+            title=branch_title,
+            messages=forked_messages,
+            parent_session_id=source.session_id,
+        )
+        with LOCK:
+            SESSIONS[branch.session_id] = branch
+            SESSIONS.move_to_end(branch.session_id)
+            while len(SESSIONS) > SESSIONS_MAX:
+                SESSIONS.popitem(last=False)
+
+        # Persist only if there are messages (matches new_session pattern)
+        if forked_messages:
+            branch.save()
+
+        return j(handler, {
+            "session_id": branch.session_id,
+            "title": branch_title,
+            "parent_session_id": source.session_id,
+        })
 
     if parsed.path == "/api/session/compress":
         return _handle_session_compress(handler, body)
@@ -2709,6 +2931,66 @@ def _handle_approval_pending(handler, parsed):
     return j(handler, {"pending": None, "pending_count": 0})
 
 
+def _handle_approval_sse_stream(handler, parsed):
+    """SSE endpoint for real-time approval notifications.
+
+    Long-lived connection that pushes approval events the moment they arrive,
+    replacing the 1.5s polling loop.  The frontend uses EventSource and falls
+    back to HTTP polling if the connection fails.
+    """
+    sid = parse_qs(parsed.query).get("session_id", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+
+    # Subscribe AND snapshot atomically under a single _lock acquisition so a
+    # submit_pending() that fires between the two cannot be lost. If we
+    # snapshot first then subscribe (the naive ordering), an approval that
+    # arrives in the gap is appended to _pending (after our snapshot) AND
+    # notified to subscribers (before we joined) — leaving the client unaware
+    # until the next event arrives.
+    q = queue.Queue(maxsize=16)
+    initial_pending = None
+    initial_count = 0
+    with _lock:
+        _approval_sse_subscribers.setdefault(sid, []).append(q)
+        q_list = _pending.get(sid)
+        if isinstance(q_list, list):
+            initial_pending = dict(q_list[0]) if q_list else None
+            initial_count = len(q_list)
+        elif q_list:
+            initial_pending = dict(q_list)
+            initial_count = 1
+
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.send_header('X-Accel-Buffering', 'no')
+    handler.send_header('Connection', 'keep-alive')
+    handler.end_headers()
+
+    from api.streaming import _sse
+
+    # Push initial state immediately so the client doesn't miss anything.
+    _sse(handler, 'initial', {"pending": initial_pending, "pending_count": initial_count})
+
+    try:
+        while True:
+            try:
+                payload = q.get(timeout=30)
+            except queue.Empty:
+                # Keepalive — SSE comment line prevents proxy/CDN timeout.
+                handler.wfile.write(b': keepalive\n\n')
+                handler.wfile.flush()
+                continue
+            if payload is None:
+                break  # signal to close
+            _sse(handler, 'approval', payload)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass  # client went away — normal for long-lived connections
+    finally:
+        _approval_sse_unsubscribe(sid, q)
+
+
 def _handle_approval_inject(handler, parsed):
     """Inject a fake pending approval -- loopback-only, used by automated tests."""
     qs = parse_qs(parsed.query)
@@ -2735,6 +3017,78 @@ def _handle_clarify_pending(handler, parsed):
     if pending:
         return j(handler, {"pending": pending})
     return j(handler, {"pending": None})
+
+
+def _handle_clarify_sse_stream(handler, parsed):
+    """SSE endpoint for real-time clarify notifications.
+
+    Long-lived connection that pushes clarify events the moment they arrive,
+    replacing the 1.5s polling loop.  The frontend uses EventSource and falls
+    back to HTTP polling if the connection fails.
+    """
+    if clarify_sse_subscribe is None:
+        return bad(handler, "clarify SSE not available")
+
+    sid = parse_qs(parsed.query).get("session_id", [""])[0]
+    if not sid:
+        return bad(handler, "session_id is required")
+
+    # Subscribe AND snapshot atomically.  We import clarify's _lock so that
+    # subscribe and the snapshot read happen under the same mutex — same
+    # pattern as the approval SSE handler.
+    #
+    # NOTE: We must NOT call clarify.get_pending() here — it acquires _lock
+    # internally, which would deadlock since clarify._lock is a non-reentrant
+    # threading.Lock.  Instead, read _gateway_queues / _pending inline under
+    # the lock we already hold.
+    from api.clarify import (
+        _lock as _clarify_lock,
+        _clarify_sse_subscribers as _clarify_subs,
+        _gateway_queues as _clarify_gateway_queues,
+        _pending as _clarify_pending,
+    )
+    q = queue.Queue(maxsize=16)
+    initial_pending = None
+    initial_count = 0
+    with _clarify_lock:
+        _clarify_subs.setdefault(sid, []).append(q)
+        gw_q = _clarify_gateway_queues.get(sid) or []
+        if gw_q:
+            initial_pending = dict(gw_q[0].data)
+            initial_count = len(gw_q)
+        else:
+            _legacy = _clarify_pending.get(sid)
+            if _legacy:
+                initial_pending = dict(_legacy)
+                initial_count = 1
+
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.send_header('X-Accel-Buffering', 'no')
+    handler.send_header('Connection', 'keep-alive')
+    handler.end_headers()
+
+    from api.streaming import _sse
+
+    # Push initial state immediately so the client doesn't miss anything.
+    _sse(handler, 'initial', {"pending": initial_pending, "pending_count": initial_count})
+
+    try:
+        while True:
+            try:
+                payload = q.get(timeout=30)
+            except queue.Empty:
+                handler.wfile.write(b': keepalive\n\n')
+                handler.wfile.flush()
+                continue
+            if payload is None:
+                break
+            _sse(handler, 'clarify', payload)
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    finally:
+        clarify_sse_unsubscribe(sid, q)
 
 
 def _handle_clarify_inject(handler, parsed):
@@ -2794,6 +3148,15 @@ def _handle_live_models(handler, parsed):
         # works even when hermes_cli is not on sys.path.
         from api.config import _resolve_provider_alias
         provider = _resolve_provider_alias(provider)
+
+        cache_key = _live_models_cache_key(provider)
+        cached = _get_cached_live_models(cache_key)
+        if cached is not None:
+            return j(handler, cached)
+
+        def _finish(payload: dict):
+            _set_cached_live_models(cache_key, payload)
+            return j(handler, payload)
 
         # Delegate to the agent's live-fetch + fallback resolver.
         # provider_model_ids() tries live endpoints first and falls back to
@@ -2912,7 +3275,7 @@ def _handle_live_models(handler, parsed):
             from api.config import _PROVIDER_MODELS as _pm
             ids = [m["id"] for m in _pm.get(provider, [])]
         if not ids:
-            return j(handler, {"provider": provider, "models": [], "count": 0})
+            return _finish({"provider": provider, "models": [], "count": 0})
 
         # Normalise to {id, label} — provider_model_ids() returns plain string IDs.
         # For ollama-cloud use the shared Ollama formatter (handles `:variant` suffix).
@@ -2945,8 +3308,8 @@ def _handle_live_models(handler, parsed):
             return label
 
         models_out = [{"id": mid, "label": _make_label(mid)} for mid in ids if mid]
-        return j(handler, {"provider": provider, "models": models_out,
-                           "count": len(models_out)})
+        return _finish({"provider": provider, "models": models_out,
+                        "count": len(models_out)})
 
     except Exception as _e:
         logger.debug("_handle_live_models failed for %s: %s", provider, _e)
@@ -3500,7 +3863,6 @@ def _handle_cron_run(handler, body):
     if not job_id:
         return bad(handler, "job_id required")
     from cron.jobs import get_job
-    from cron.scheduler import run_job
 
     job = get_job(job_id)
     if not job:
@@ -3773,6 +4135,16 @@ def _handle_approval_respond(handler, body):
         elif queue:
             # Legacy single-dict value.
             pending = _pending.pop(sid, None)
+        # Notify SSE subscribers of the new head (or empty state) so the UI
+        # surfaces any trailing approvals that were queued behind this one
+        # without waiting for the next submit_pending. Without this, a parallel
+        # tool-call scenario (#527) would leave the second approval invisible
+        # in the SSE path until the next event ever fired (the agent thread
+        # would be parked indefinitely from the user's perspective).
+        if isinstance(_pending.get(sid), list) and _pending[sid]:
+            _approval_sse_notify_locked(sid, _pending[sid][0], len(_pending[sid]))
+        else:
+            _approval_sse_notify_locked(sid, None, 0)
 
     if pending:
         keys = pending.get("pattern_keys") or [pending.get("pattern_key", "")]
@@ -4186,6 +4558,8 @@ def _handle_session_import_cli(handler, body):
     created_at = None
     updated_at = None
     cli_title = None
+    cli_source_tag = None
+    model = "unknown"
     for cs in get_cli_sessions():
         if cs["session_id"] == sid:
             profile = cs.get("profile")
@@ -4193,10 +4567,16 @@ def _handle_session_import_cli(handler, body):
             created_at = cs.get("created_at")
             updated_at = cs.get("updated_at")
             cli_title = cs.get("title")
+            cli_source_tag = cs.get("source_tag")
             break
 
     # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
     title = cli_title or title_from(msgs, "CLI Session")
+
+    # Auto-assign cron sessions to the dedicated "Cron Jobs" project (#1079)
+    cron_project_id = None
+    if is_cron_session(sid, cli_source_tag):
+        cron_project_id = ensure_cron_project()
 
     s = import_cli_session(
         sid,
@@ -4207,6 +4587,8 @@ def _handle_session_import_cli(handler, body):
         created_at=created_at,
         updated_at=updated_at,
     )
+    if cron_project_id:
+        s.project_id = cron_project_id
     s.is_cli_session = True
     s._cli_origin = sid
     s.save(touch_updated_at=False)
