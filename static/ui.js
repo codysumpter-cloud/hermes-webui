@@ -62,8 +62,10 @@ function _renderUserFencedBlocks(text){
   const stash=[];
   let s=String(text||'');
   // Extract fenced code blocks → stash, replace with null-token placeholder
-  s=s.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g,(_,lang,code)=>{
+  // CommonMark line-anchored fence (fixes #1438): inner ``` inside content no longer truncates the block.
+  s=s.replace(/(^|\n)[ ]{0,3}```([a-zA-Z0-9_+-]*)\n(?:([\s\S]*?)\n)?[ ]{0,3}```(?=\n|$)/g,(_,lead,lang,code)=>{
     lang=(lang||'').trim().toLowerCase();
+    code=code||'';
     // Remove one trailing newline if present (the fence consumes its own)
     if(code.endsWith('\n')) code=code.slice(0,-1);
     const h=lang?`<div class="pre-header">${esc(lang)}</div>`:'';
@@ -79,7 +81,7 @@ function _renderUserFencedBlocks(text){
     } else {
       stash.push(`${h}<pre><code${langAttr}>${esc(code)}</code></pre>`);
     }
-    return '\x00UF'+(stash.length-1)+'\x00';
+    return lead+'\x00UF'+(stash.length-1)+'\x00';
   });
   // Escape remaining plain text and convert newlines to <br>
   s=esc(s).replace(/\n/g,'<br>');
@@ -225,6 +227,7 @@ setTimeout(_initMediaPlaybackObserver,0);
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
 let _dynamicModelLabels={};
 window._configuredModelBadges=window._configuredModelBadges||{};
+const MODEL_STATE_KEY='hermes-webui-model-state';
 
 // ── Smart model resolver ────────────────────────────────────────────────────
 // Finds the best matching option value in a <select> for a given model ID.
@@ -239,8 +242,59 @@ function _getOptionProviderId(opt){
     return group.dataset.provider;
   }
   const value=String(opt.value||'');
-  if(value.startsWith('@') && value.includes(':')) return value.slice(1,value.indexOf(':'));
+  if(value.startsWith('@') && value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
   return '';
+}
+function _providerFromModelValue(modelId){
+  const value=String(modelId||'').trim();
+  if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
+  return '';
+}
+function _modelStateForSelect(sel, modelId){
+  const value=String(modelId||'').trim();
+  if(!value) return {model:'',model_provider:null};
+  const explicitProvider=_providerFromModelValue(value);
+  if(explicitProvider) return {model:value,model_provider:explicitProvider};
+  const opt=sel&&sel.selectedOptions&&sel.selectedOptions[0];
+  const provider=String(_getOptionProviderId(opt)||'').trim();
+  return {model:value,model_provider:(provider&&provider!=='default')?provider:null};
+}
+function _providerQualifiedModelValueForSelect(sel, modelId){
+  return _modelStateForSelect(sel,modelId).model;
+}
+function _readPersistedModelState(){
+  try{
+    const raw=localStorage.getItem(MODEL_STATE_KEY);
+    if(raw){
+      const parsed=JSON.parse(raw);
+      if(parsed&&parsed.model){
+        return {
+          model:String(parsed.model||''),
+          model_provider:parsed.model_provider?String(parsed.model_provider):(_providerFromModelValue(parsed.model)||null),
+        };
+      }
+    }
+  }catch(_){}
+  const legacy=localStorage.getItem('hermes-webui-model');
+  if(!legacy) return null;
+  return {model:legacy,model_provider:_providerFromModelValue(legacy)||null};
+}
+function _writePersistedModelState(model, modelProvider){
+  const value=String(model||'').trim();
+  const provider=modelProvider?String(modelProvider).trim():(_providerFromModelValue(value)||null);
+  if(!value){
+    localStorage.removeItem('hermes-webui-model');
+    localStorage.removeItem(MODEL_STATE_KEY);
+    return;
+  }
+  localStorage.setItem('hermes-webui-model', value);
+  try{
+    localStorage.setItem(MODEL_STATE_KEY, JSON.stringify({model:value,model_provider:provider||null}));
+  }catch(_){}
+}
+function _clearPersistedModelState(){
+  localStorage.removeItem('hermes-webui-model');
+  localStorage.removeItem(MODEL_STATE_KEY);
 }
 function _findModelInDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
@@ -250,7 +304,12 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
   // Also strip @provider: prefix from deduplicated model IDs (#1228, #1313).
   const norm=s=>s.toLowerCase().replace(/^[^/]+\//,'').replace(/^@([^:]+:)+/,'').replace(/-/g,'.');
   const target=norm(modelId);
-  const preferred=String(preferredProviderId||'').toLowerCase();
+  let explicitProvider='';
+  const rawModel=String(modelId||'');
+  if(rawModel.startsWith('@')&&rawModel.includes(':')){
+    explicitProvider=rawModel.slice(1,rawModel.lastIndexOf(':'));
+  }
+  const preferred=String(preferredProviderId||explicitProvider||'').toLowerCase();
   if(preferred){
     const providerMatch=options.find(o=>norm(o.value)===target && _getOptionProviderId(o).toLowerCase()===preferred);
     if(providerMatch) return providerMatch.value;
@@ -287,7 +346,7 @@ async function populateModelDropdown(){
   const sel=$('modelSelect');
   if(!sel) return;
   try{
-    const _modelsRes=await fetch(new URL('api/models',location.href).href,{credentials:'include'});
+    const _modelsRes=await fetch(new URL('api/models',document.baseURI||location.href).href,{credentials:'include'});
     if(_redirectIfUnauth(_modelsRes)) return;
     const data=await _modelsRes.json();
     if(!data.groups||!data.groups.length) return; // keep HTML defaults
@@ -314,7 +373,7 @@ async function populateModelDropdown(){
       sel.appendChild(og);
     }
     // Set default model from server if no localStorage preference
-    if(data.default_model && !localStorage.getItem('hermes-webui-model')){
+    if(data.default_model && !(typeof _readPersistedModelState==='function'&&_readPersistedModelState()) && !localStorage.getItem('hermes-webui-model')){
       _applyModelToDropdown(data.default_model, sel, data.active_provider||null);
     }
     if(typeof syncModelChip==='function') syncModelChip();
@@ -367,7 +426,7 @@ function _addLiveModelsToSelect(provider, models, sel){
   const existingNorm=new Set([...sel.options].map(o=>_normId(o.value)));
   let added=0;
   const _ap=(window._activeProvider||'').toLowerCase();
-  const _isPortalFetch=_ap && _ap!=='openrouter' && _ap!=='custom' && provider===_ap;
+  const _isPortalFetch=_ap && _ap!=='openrouter' && _ap!=='custom' && _ap!=='openai-codex' && provider===_ap;
   for(const m of models){
     let mid=m.id;
     if(_isPortalFetch && !mid.startsWith('@')){
@@ -383,13 +442,14 @@ function _addLiveModelsToSelect(provider, models, sel){
     _dynamicModelLabels[mid]=m.label||m.id;
     added++;
   }
-  if(added>0 && currentVal) _applyModelToDropdown(currentVal, sel);
+  const currentProvider=(S.session&&S.session.model_provider)||null;
+  if(added>0 && currentVal) _applyModelToDropdown(currentVal, sel, currentProvider);
   // After live models are added, re-apply the session's model in case it was
   // absent from the static list and syncTopbar() fired before the live fetch
   // completed (#1169). This ensures the session model wins over any premature
   // fallback that may have set sel.value to the first available option.
   if(S.session && S.session.model && sel.id==='modelSelect'){
-    const reapplied=_applyModelToDropdown(S.session.model, sel);
+    const reapplied=_applyModelToDropdown(S.session.model, sel, S.session.model_provider||null);
     if(reapplied && typeof syncModelChip==='function') syncModelChip();
   }
   return added;
@@ -405,7 +465,7 @@ async function _fetchLiveModels(provider, sel){
   }
   _liveModelFetchPending.add(provider);
   try{
-    const url=new URL('api/models/live',location.href);
+    const url=new URL('api/models/live',document.baseURI||location.href);
     url.searchParams.set('provider',provider);
     const _liveRes=await fetch(url.href,{credentials:'include'});
     if(_redirectIfUnauth(_liveRes)) return;
@@ -706,6 +766,7 @@ function toggleModelDropdown(){
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   renderModelDropdown();
   dd.classList.add('open');
   _positionModelDropdown();
@@ -805,6 +866,7 @@ function toggleReasoningDropdown(){
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   _highlightReasoningOption(_currentReasoningEffort);
   dd.classList.add('open');
   _positionReasoningDropdown();
@@ -859,6 +921,184 @@ document.addEventListener('click',function(e){
   }
 });
 
+// ── Session toolsets chip (#493) ───────────────────────────────────────────
+let _currentSessionToolsets = null; // null = global, array = custom list
+
+function _applyToolsetsChip(toolsets) {
+  _currentSessionToolsets = toolsets;
+  const wrap = $('composerToolsetsWrap');
+  const label = $('composerToolsetsLabel');
+  const chip = $('composerToolsetsChip');
+  if (!wrap || !label) return;
+  // Visibility is controlled entirely by responsive CSS — the chip shows only
+  // at wide composer-footer widths (>= 1100px container query). At narrower
+  // widths the layout is too cramped (model + reasoning + profile + workspace
+  // + context-ring + send) to add another chip. Cleared inline style so the
+  // CSS @container query is the single source of truth. State is still
+  // tracked so /api/session/toolsets continues to work for cron/scripted
+  // callers regardless of UI visibility. (#1431)
+  wrap.style.display = '';
+  const hasCustom = Array.isArray(toolsets) && toolsets.length > 0;
+  if (hasCustom) {
+    label.textContent = toolsets.join(', ');
+    chip.classList.add('has-custom');
+    chip.title = t('session_toolsets') + ': ' + toolsets.join(', ');
+  } else {
+    label.textContent = t('session_toolsets_global');
+    chip.classList.remove('has-custom');
+    chip.title = t('session_toolsets');
+  }
+}
+
+function _syncToolsetsChip() {
+  if (typeof S === 'undefined' || !S || !S.session) {
+    _applyToolsetsChip(null);
+    return;
+  }
+  _applyToolsetsChip(S.session.enabled_toolsets || null);
+}
+
+function syncToolsetsChip() {
+  _syncToolsetsChip();
+}
+
+function _populateToolsetsDropdown() {
+  const desc = $('toolsetsDropdownDesc');
+  const state = $('toolsetsDropdownState');
+  const input = $('toolsetsInput');
+  const applyBtn = $('toolsetsApplyBtn');
+  const clearBtn = $('toolsetsClearBtn');
+  if (!desc || !state || !input) return;
+  desc.textContent = t('session_toolsets_desc');
+  if (applyBtn) applyBtn.textContent = t('session_toolsets_apply');
+  if (clearBtn) clearBtn.textContent = t('session_toolsets_clear');
+  input.placeholder = t('session_toolsets_placeholder');
+  // Escape key handler for toolsets input
+  input.onkeydown = function(e) { if(e.key === 'Escape') closeToolsetsDropdown(); };
+  const hasCustom = Array.isArray(_currentSessionToolsets) && _currentSessionToolsets.length > 0;
+  if (hasCustom) {
+    state.textContent = '🔧 ' + _currentSessionToolsets.join(', ');
+    input.value = _currentSessionToolsets.join(', ');
+  } else {
+    state.textContent = '🌍 ' + t('session_toolsets_global');
+    input.value = '';
+  }
+}
+
+function _positionToolsetsDropdown() {
+  const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
+  const footer = document.querySelector('.composer-footer');
+  if (!dd || !chip || !footer) return;
+  // Defense: if the chip has been hidden by responsive CSS (e.g. resize across
+  // 1100px container threshold while dropdown was open), don't try to anchor
+  // to a zero-rect element — close the dropdown instead. (#1431)
+  if (chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  const chipRect = chip.getBoundingClientRect();
+  const footerRect = footer.getBoundingClientRect();
+  let left = chipRect.left - footerRect.left;
+  const maxLeft = Math.max(0, footer.clientWidth - dd.offsetWidth);
+  left = Math.max(0, Math.min(left, maxLeft));
+  dd.style.left = left + 'px';
+}
+
+function toggleToolsetsDropdown() {
+  const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
+  if (!dd || !chip) return;
+  if (typeof S === 'undefined' || !S || !S.session) return;
+  // Don't open when the chip itself is hidden by responsive CSS (#1431).
+  // offsetParent === null catches display:none on the element or any ancestor.
+  if (chip.offsetParent === null) return;
+  const open = dd.classList.contains('open');
+  if (open) { closeToolsetsDropdown(); return; }
+  if (typeof closeProfileDropdown === 'function') closeProfileDropdown();
+  if (typeof closeWsDropdown === 'function') closeWsDropdown();
+  closeModelDropdown();
+  if (typeof closeReasoningDropdown === 'function') closeReasoningDropdown();
+  _syncToolsetsChip();
+  _populateToolsetsDropdown();
+  dd.classList.add('open');
+  _positionToolsetsDropdown();
+  chip.classList.add('active');
+  // Focus the input after a tick so the layout has settled
+  setTimeout(() => { const inp = $('toolsetsInput'); if (inp) inp.focus(); }, 50);
+}
+
+function closeToolsetsDropdown() {
+  const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
+  if (dd) dd.classList.remove('open');
+  if (chip) chip.classList.remove('active');
+}
+
+function _applySessionToolsets(toolsets) {
+  if (typeof S === 'undefined' || !S || !S.session) return;
+  const sid = S.session.session_id;
+  api('/api/session/toolsets', {
+    method: 'POST',
+    body: JSON.stringify({ session_id: sid, toolsets: toolsets })
+  })
+    .then(function(r) {
+      if (r && r.ok) {
+        S.session.enabled_toolsets = r.enabled_toolsets || null;
+        _applyToolsetsChip(r.enabled_toolsets || null);
+        if (r.enabled_toolsets && r.enabled_toolsets.length) {
+          showToast('🔧 ' + t('session_toolsets_applied') + ': ' + r.enabled_toolsets.join(', '));
+        } else {
+          showToast('🌍 ' + t('session_toolsets_cleared'));
+        }
+      } else {
+        showToast(t('session_toolsets_failed') + (r && r.error ? r.error : 'Unknown error'), 3000, 'error');
+      }
+    })
+    .catch(function(err) {
+      showToast(t('session_toolsets_failed') + (err.message || err), 3000, 'error');
+    });
+}
+
+// Click-outside handler for toolsets dropdown
+document.addEventListener('click', function(e) {
+  if (
+    !e.target.closest('#composerToolsetsChip') &&
+    !e.target.closest('#composerToolsetsDropdown')
+  ) closeToolsetsDropdown();
+  // Apply button
+  if (e.target.closest('#toolsetsApplyBtn')) {
+    const input = $('toolsetsInput');
+    if (!input) return;
+    const raw = input.value.trim();
+    if (!raw) {
+      showToast(t('session_toolsets_desc'), 2000);
+      return;
+    }
+    const toolsets = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (toolsets.length === 0) {
+      showToast(t('session_toolsets_desc'), 2000);
+      return;
+    }
+    _applySessionToolsets(toolsets);
+    closeToolsetsDropdown();
+  }
+  // Clear button
+  if (e.target.closest('#toolsetsClearBtn')) {
+    _applySessionToolsets(null);
+    closeToolsetsDropdown();
+  }
+});
+
+// Position toolsets dropdown on resize, OR close it if the chip is no longer
+// visible (e.g. resize crossed the 1100px container threshold while dropdown
+// was open — the wrap is hidden by CSS but the dropdown sibling stays open
+// without an anchor). (#1431)
+window.addEventListener('resize', () => {
+  const dd = $('composerToolsetsDropdown');
+  if (!dd || !dd.classList.contains('open')) return;
+  const chip = $('composerToolsetsChip');
+  if (!chip || chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  _positionToolsetsDropdown();
+});
+
 function _syncMobileComposerConfigButton(open){
   const btn=$('composerMobileConfigBtn');
   if(!btn) return;
@@ -881,12 +1121,14 @@ function toggleMobileComposerConfig(){
     closeMobileComposerConfig();
     closeModelDropdown();
     closeReasoningDropdown();
+    if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
     return;
   }
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
   closeReasoningDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   panel.classList.add('open');
   _syncMobileComposerConfigButton(true);
 }
@@ -1025,8 +1267,13 @@ function _syncCtxIndicator(usage){
   const wrap=$('ctxIndicatorWrap');
   const el=$('ctxIndicator');
   if(!el)return;
-  // Use input_tokens as fallback when last_prompt_tokens is not available
-  const promptTok=usage.last_prompt_tokens||usage.input_tokens||0;
+  // #1436: Use last_prompt_tokens only — NEVER fall back to cumulative
+  // input_tokens for the "context window % used" calculation.  input_tokens
+  // is summed across all turns, so dividing it by the context window gives a
+  // nonsense percentage (often >100%) on long sessions.  When we have no
+  // last-prompt data we render "·" + "tokens used" via the !hasPromptTok
+  // branch below — honest "no data" instead of misleading "890% used".
+  const promptTok=usage.last_prompt_tokens||0;
   const totalTok=(usage.input_tokens||0)+(usage.output_tokens||0);
   // Default context window to 128K when not provided by backend
   const DEFAULT_CTX=128*1024;
@@ -1304,7 +1551,12 @@ function renderMd(raw){
   // breaking </pre> closure and corrupting all subsequent message rendering.
   const _preBlock_stash=[];
   const fence_stash=[];
-  s=s.replace(/```([\s\S]*?)```/g,(_,raw)=>{
+  // CommonMark §4.5: opening fence must start a line (with up to 3 spaces of indent)
+  // and closing fence must also start a line. Without line anchoring, a literal ``` inside
+  // a code block (e.g. a regex pattern with ``` in a lookbehind, a script that documents
+  // fences) terminates the outer block at the wrong place, leaking content into the
+  // markdown stream where bold/italic/inline-code passes corrupt it. Fixes #1438.
+  s=s.replace(/(^|\n)[ ]{0,3}```(?:([\s\S]*?)\n)?[ ]{0,3}```(?=\n|$)/g,(_,lead,raw)=>{
     const m=raw.match(/^(\w[\w+-]*)\n?([\s\S]*)$/);
     const lang=m?(m[1]||'').trim().toLowerCase():'';
     const code=m?m[2]:raw.replace(/^\n?/,'');
@@ -1331,8 +1583,11 @@ function renderMd(raw){
       // For JSON/YAML blocks, add tree-view placeholder with raw data
       } else if(lang==='json'||lang==='yaml'){
         const rawCode=esc(code.replace(/\n$/,''));
+        // Encode newlines as &#10; to prevent HTML attribute normalization
+        // (browsers collapse \n to spaces inside attribute values).
+        const rawAttr=rawCode.replace(/"/g,'&quot;').replace(/\n/g,'&#10;');
         const blockId='tree-'+Math.random().toString(36).slice(2,10);
-        _preBlock_stash.push(`<div class="code-tree-wrap" data-raw="${rawCode.replace(/"/g,'&quot;')}" data-lang="${lang}" id="${blockId}">${h}<pre class="tree-raw-view"><code${langAttr}>${rawCode}</code></pre></div>`);
+        _preBlock_stash.push(`<div class="code-tree-wrap" data-raw="${rawAttr}" data-lang="${lang}" id="${blockId}">${h}<pre class="tree-raw-view"><code${langAttr}>${rawCode}</code></pre></div>`);
       // CSV blocks → render as styled table
       } else if(lang==='csv'){
         const rows=code.replace(/\n$/,'').split('\n').filter(r=>r.trim());
@@ -1347,7 +1602,7 @@ function renderMd(raw){
         _preBlock_stash.push(`${h}<pre><code${langAttr}>${esc(code.replace(/\n$/,''))}</code></pre>`);
       }
     }
-    return '\x00P'+(_preBlock_stash.length-1)+'\x00';
+    return lead+'\x00P'+(_preBlock_stash.length-1)+'\x00';
   });
   s=s.replace(/`([^`\n]+)`/g,(_,c)=>{fence_stash.push('<code>'+esc(c)+'</code>');return '\x00F'+(fence_stash.length-1)+'\x00';});
   // Math stash: protect $$..$$ and $..$ from markdown processing
@@ -1374,6 +1629,31 @@ function renderMd(raw){
   s=s.replace(/<code>([^<]*?)<\/code>/gi,(_,t)=>'`'+t+'`');
   s=s.replace(/<br\s*\/?>/gi,'\n');
   s=s.replace(/\x00R(\d+)\x00/g,(_,i)=>rawPreStash[+i]);
+  // ── Glued-bold-heading lift (issue #1446) ────────────────────────────────
+  // LLMs in thinking/reasoning mode frequently emit a "section header" glued
+  // to the end of the previous paragraph with no whitespace, like:
+  //
+  //   Para 1 text.**Heading to Para 2**
+  //
+  //   Para 2 text.**Heading to Para 3**
+  //
+  // CommonMark renders that correctly as paragraph-end inline bold, but the
+  // visual effect is a run-on label rather than a section break. Lift the
+  // glued bold into its own paragraph when it follows a sentence terminator
+  // and is followed by a blank line.
+  //
+  // Constraints (avoid false positives):
+  //   - Trigger only on a sentence terminator (.!?) IMMEDIATELY before `**`
+  //     (no space) — that pattern is almost always a glued heading, not
+  //     intentional emphasis.
+  //   - Inner text length ≤ 80 chars — long bold runs are usually emphasis
+  //     prose, not headings.
+  //   - Trailing `\n\n` required — preserves mid-paragraph emphasis like
+  //     "this is **important**." untouched.
+  //   - Inner text must not contain newlines or `*` (single-line bold only).
+  //   - Runs after fenced code, math, and raw <pre> are stashed, so code
+  //     content is protected (see pipeline notes).
+  s=s.replace(/([.!?])\*\*([^*\n]{1,80})\*\*\n\n/g,'$1\n\n**$2**\n\n');
   // Inline backtick spans: restore <code> tags produced in the stash callback above.
   // Must happen BEFORE bold/italic so **`code`** → <strong><code>code</code></strong>.
   s=s.replace(/\x00F(\d+)\x00/g,(_,i)=>fence_stash[+i]);
@@ -1882,7 +2162,10 @@ function setBusy(v){
         // Note: profile is NOT restored — full profile switch requires server interaction
         if(next.model&&S.session&&next.model!==S.session.model){
           S.session.model=next.model;
-          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'));
+        }
+        if(next.model_provider&&S.session) S.session.model_provider=next.model_provider;
+        if(next.model&&S.session){
+          if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
           if(typeof syncModelChip==='function') syncModelChip();
         }
         autoResize();
@@ -1965,8 +2248,9 @@ function _renderQueueChips(sid){
       const _doMerge=(snapshot)=>{
         const combined=snapshot.map(e=>e&&(e.text||e.message||e.content||'')).filter(Boolean).join('\n\n');
         const liveQ=_getSessionQueue(sid,false);
+        const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
-        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,_queued_at:Date.now()});
+        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
         SESSION_QUEUES[sid]=liveQ;
         try{sessionStorage.setItem('hermes-queue-'+sid,JSON.stringify(liveQ));}catch(_){}
         delete _queueRenderKeys[sid];
@@ -2228,7 +2512,7 @@ function _ensureAppDialogBindings(){
       return;
     }
     if(e.key==='Enter'){
-      if(e.isComposing) return;
+      if(window._isImeEnter&&window._isImeEnter(e)) return;
       const target=e.target;
       const isTextarea=target&&target.tagName==='TEXTAREA';
       if(!isTextarea){
@@ -2336,8 +2620,8 @@ function copyMsg(btn){
 // ── TTS: Text-to-Speech via Web Speech API (#499) ──
 // Strips markdown, code blocks, and MEDIA: paths for clean speech output.
 function _stripForTTS(text){
-  // Remove code blocks entirely (```)
-  text=text.replace(/```[\s\S]*?```/g,' ');
+  // Remove code blocks entirely (```) — line-anchored to match #1438 fix
+  text=text.replace(/(^|\n)[ ]{0,3}```(?:[\s\S]*?\n)?[ ]{0,3}```(?=\n|$)/g,' ');
   // Remove inline code
   text=text.replace(/`[^`]+`/g,' ');
   // Strip bold/italic
@@ -2728,10 +3012,12 @@ function syncTopbar(){
   let currentModel=S.session.model||'';
   if(modelOverride){
     S._pendingProfileModel=null;
-    _applyModelToDropdown(modelOverride,$('modelSelect'));
+    const providerOverride=S._pendingProfileModelProvider||null;
+    S._pendingProfileModelProvider=null;
+    _applyModelToDropdown(modelOverride,$('modelSelect'),providerOverride);
     currentModel=modelOverride;
   } else {
-    const applied=_applyModelToDropdown(currentModel,$('modelSelect'));
+    const applied=_applyModelToDropdown(currentModel,$('modelSelect'),S.session.model_provider||null);
     // If the model isn't in the current provider list, silently reset to the
     // first available model so stale values don't pollute the picker (#829).
     if(!applied && currentModel){
@@ -2753,11 +3039,12 @@ function syncTopbar(){
           modelSel.value=first.value;
           if(!deferModelCorrection){
             S.session.model=first.value;
+            S.session.model_provider=_getOptionProviderId(first)||null;
             // Persist the correction so the session doesn't re-inject on next load.
-            fetch(new URL('api/session/update',location.href).href,{
+            fetch(new URL('api/session/update',document.baseURI||location.href).href,{
               method:'POST',credentials:'include',
               headers:{'Content-Type':'application/json'},
-              body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:first.value})
+              body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:first.value,model_provider:S.session.model_provider||null})
             }).catch(()=>{});
           }
         }
@@ -2766,6 +3053,7 @@ function syncTopbar(){
   }
   if(typeof syncModelChip==='function') syncModelChip();
   if(typeof syncReasoningChip==='function') syncReasoningChip();
+  if(typeof syncToolsetsChip==='function') syncToolsetsChip();
   // Show Clear button only when session has messages
   const clearBtn=$('btnClearConv');
   if(clearBtn) clearBtn.style.display=(S.messages&&S.messages.filter(msg=>msg.role!=='tool').length>0)?'':'none';
@@ -3841,7 +4129,7 @@ function editMessage(btn) {
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
 
   ta.addEventListener('keydown', e => {
-    if(e.key==='Enter' && !e.shiftKey) { if(e.isComposing) return; e.preventDefault(); bar.querySelector('.msg-edit-send').click(); }
+    if(e.key==='Enter' && !e.shiftKey) { if(window._isImeEnter&&window._isImeEnter(e)) return; e.preventDefault(); bar.querySelector('.msg-edit-send').click(); }
     if(e.key==='Escape') { e.preventDefault(); cancelEdit(row, originalText, body); }
   });
 }
@@ -3927,7 +4215,6 @@ function _loadJsyamlThen(cb){
 
 function initTreeViews(){
   document.querySelectorAll('.code-tree-wrap:not([data-tree-init])').forEach(wrap=>{
-    wrap.setAttribute('data-tree-init','1');
     const rawText=wrap.dataset.raw;
     const lang=wrap.dataset.lang;
     let parsed=null;
@@ -3939,10 +4226,16 @@ function initTreeViews(){
       if(typeof jsyaml!=='undefined'){
         try{ parsed=jsyaml.load(rawText); }catch(e){ parseFailed=true; }
       }else{
-        // Trigger async load, leave as raw for now
-        parseFailed=true;
+        // Defer: remove init marker so we retry after load.
+        // Note: if CDN load fails, s.onerror does NOT call back —
+        // the wrap stays un-initialised (raw view only), which is safe.
+        wrap.removeAttribute('data-tree-init');
+        _loadJsyamlThen(initTreeViews);
+        return;
       }
     }
+    // Mark as initialised only after we've committed to a render decision
+    wrap.setAttribute('data-tree-init','1');
     if(!parsed || typeof parsed!=='object'){
       if(parseFailed){
         const hint=wrap.querySelector('.tree-raw-view');
@@ -4738,7 +5031,7 @@ function _renderTreeItems(container, entries, depth){
       };
       inp.onkeydown=(e2)=>{
         if(e2.key==='Enter'){
-          if(e2.isComposing){return;}
+          if(window._isImeEnter&&window._isImeEnter(e2)){return;}
           e2.preventDefault();
           finish(true);
         }
@@ -5004,7 +5297,7 @@ async function uploadPendingFiles(){
     fd.append('session_id',S.session.session_id);fd.append('file',f,f.name);
     try{
       const isArchive=_ARCHIVE_EXTS.test(f.name);
-      const url=new URL(isArchive?'api/upload/extract':'api/upload',location.href).href;
+      const url=new URL(isArchive?'api/upload/extract':'api/upload',document.baseURI||location.href).href;
       const res=await fetch(url,{method:'POST',credentials:'include',body:fd});
       if(_redirectIfUnauth(res)) return;
       if(!res.ok){const err=await res.text();throw new Error(err);}

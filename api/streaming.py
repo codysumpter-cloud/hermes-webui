@@ -26,6 +26,7 @@ from api.config import (
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
+    model_with_provider_context,
 )
 from api.helpers import redact_session_data
 from api.metering import meter
@@ -1342,7 +1343,17 @@ def _last_resort_sync_from_core(session, stream_id, agent_lock):
         )
 
 
-def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, attachments=None, *, ephemeral=False):
+def _run_agent_streaming(
+    session_id,
+    msg_text,
+    model,
+    workspace,
+    stream_id,
+    attachments=None,
+    *,
+    ephemeral=False,
+    model_provider=None,
+):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
     When ephemeral=True, session mutations are skipped — used by /btw to get
@@ -1418,6 +1429,12 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         s = get_session(session_id)
         s.workspace = str(Path(workspace).expanduser().resolve())
         s.model = model
+        provider_context = (
+            str(model_provider).strip().lower()
+            if model_provider is not None
+            else getattr(s, "model_provider", None)
+        )
+        s.model_provider = provider_context or None
 
         _agent_lock = _get_session_agent_lock(session_id)
         # TD1: set thread-local env context so concurrent sessions don't clobber globals
@@ -1701,7 +1718,9 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 _session_db = SessionDB()
             except Exception as _db_err:
                 print(f"[webui] WARNING: SessionDB init failed — session_search will be unavailable: {_db_err}", flush=True)
-            resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(model)
+            resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
+                model_with_provider_context(model, provider_context)
+            )
 
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
             # Pass the resolved provider so non-default providers get their own credentials.
@@ -1725,6 +1744,25 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             # server toolsets are included, matching native CLI behaviour.
             from api.config import _resolve_cli_toolsets
             _toolsets = _resolve_cli_toolsets(_cfg)
+
+            # Per-session toolset override (#493): if the session has
+            # enabled_toolsets set, use that instead of the global config.
+            try:
+                from api.models import Session, SESSION_DIR
+                _session_path = SESSION_DIR / f"{session_id}.json"
+                if _session_path.exists():
+                    _session_meta = Session.load_metadata_only(session_id)
+                    # load_metadata_only returns a Session INSTANCE, not a dict.
+                    # The previous .get('enabled_toolsets') raised AttributeError
+                    # which was swallowed by the bare except below — the entire
+                    # per-session toolset override silently no-op'd. Use
+                    # getattr() to read the attribute correctly.
+                    # (Opus pre-release advisor finding for v0.50.257.)
+                    _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
+                    if _override:
+                        _toolsets = _override
+            except Exception as _ts_err:
+                print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 
             # Fallback model from profile config (e.g. for rate-limit recovery)
             _fallback = _cfg.get('fallback_model') or _cfg.get('fallback_providers') or None
@@ -1845,6 +1883,15 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                     if hasattr(agent, 'clarify_callback'):
                         agent.clarify_callback = _agent_kwargs.get('clarify_callback')
                     if _session_db is not None:
+                        # Close any previously held SessionDB connection before
+                        # replacing it. Without this, each streaming request creates
+                        # a new SessionDB whose WAL handles leak indefinitely,
+                        # eventually causing EMFILE crashes (#streaming FD leak).
+                        if hasattr(agent, '_session_db') and agent._session_db is not None:
+                            try:
+                                agent._session_db.close()
+                            except Exception:
+                                pass
                         agent._session_db = _session_db
                     if hasattr(agent, '_api_call_count'):
                         agent._api_call_count = 0
@@ -1861,7 +1908,19 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                         SESSION_AGENT_CACHE.move_to_end(session_id)  # LRU: mark as recently used
                         from api.config import SESSION_AGENT_CACHE_MAX
                         while len(SESSION_AGENT_CACHE) > SESSION_AGENT_CACHE_MAX:
-                            evicted_sid, _ = SESSION_AGENT_CACHE.popitem(last=False)
+                            evicted_sid, evicted_entry = SESSION_AGENT_CACHE.popitem(last=False)
+                            # Same FD-leak shape as the cached-agent reuse path
+                            # in #1421: the evicted agent's _session_db won't be
+                            # released until GC finalizes the agent, which on a
+                            # long-running server may be never. Close it
+                            # explicitly so the WAL handles release immediately.
+                            # (Opus pre-release follow-up to #1421.)
+                            try:
+                                _evicted_agent = evicted_entry[0] if isinstance(evicted_entry, tuple) else None
+                                if _evicted_agent is not None and getattr(_evicted_agent, '_session_db', None) is not None:
+                                    _evicted_agent._session_db.close()
+                            except Exception:
+                                pass
                             logger.debug('[webui] Evicted LRU agent from cache: %s', evicted_sid)
                     logger.debug('[webui] Created new agent for session %s', session_id)
 
