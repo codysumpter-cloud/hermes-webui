@@ -707,6 +707,7 @@ from api.onboarding import (
     apply_onboarding_setup,
     get_onboarding_status,
     complete_onboarding,
+    probe_provider_endpoint,
 )
 
 # Approval system (optional -- graceful fallback if agent not available)
@@ -1109,6 +1110,13 @@ def _handle_insights(handler, parsed) -> bool:
 
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
+
+    if parsed.path.startswith("/session/static/"):
+        # Strip the leading "/session" so _serve_static() sees a path that
+        # starts with "/static/" (its required prefix). _serve_static enforces
+        # its own path-traversal sandbox via Path.resolve()+relative_to().
+        stripped = parsed._replace(path=parsed.path[len("/session"):])
+        return _serve_static(handler, stripped)
 
     if parsed.path in ("/", "/index.html") or parsed.path.startswith("/session/"):
         from urllib.parse import quote
@@ -1836,6 +1844,70 @@ def handle_post(handler, parsed) -> bool:
         )
         return j(handler, {"session": s.compact() | {"messages": s.messages}})
 
+    if parsed.path == "/api/session/duplicate":
+        try:
+            sid = body.get("session_id")
+            if not sid:
+                return bad(handler, "session_id is required")
+
+            session = Session.load(sid)
+            if not session:
+                # 404, not 400 — missing resource, not a malformed request.
+                return bad(handler, "Session not found", status=404)
+
+            # Deep-copy mutable lists so the duplicate is *actually* independent.
+            # `Session.__init__` does `self.messages = messages or []` — plain
+            # assignment, no copy. Without deepcopy, both sessions share the same
+            # list object in memory; appending to one mutates the other.
+            # Items inside `messages` are dicts with mutable values (tool_calls,
+            # content arrays), so a shallow `list(...)` is not enough.
+            copied_session = Session(
+                session_id=uuid.uuid4().hex[:12],
+                # Defensive: legacy sessions may have title=None on disk; fall back to 'Untitled'
+                # so `+ " (copy)"` doesn't TypeError.
+                title=(session.title or "Untitled") + " (copy)",
+                workspace=session.workspace,
+                model=session.model,
+                model_provider=session.model_provider,
+                messages=copy.deepcopy(session.messages),
+                tool_calls=copy.deepcopy(session.tool_calls),
+                # Reset ephemeral / per-session-instance flags. Duplicating an
+                # archived conversation should produce a visible (un-archived)
+                # copy; pinned status doesn't transfer either.
+                pinned=False,
+                archived=False,
+                project_id=session.project_id,
+                profile=session.profile,
+                input_tokens=session.input_tokens,
+                output_tokens=session.output_tokens,
+                estimated_cost=session.estimated_cost,
+                # Per-session settings the user may have customized — carry them over
+                # so the duplicate behaves identically until further edits. Compression
+                # anchor + last_prompt_tokens are intentionally NOT carried — those
+                # re-derive on the next turn.
+                personality=session.personality,
+                enabled_toolsets=getattr(session, "enabled_toolsets", None),
+                context_length=getattr(session, "context_length", None),
+                threshold_tokens=getattr(session, "threshold_tokens", None),
+                created_at=time.time(),
+                updated_at=time.time(),
+            )
+
+            with LOCK:
+                SESSIONS[copied_session.session_id] = copied_session
+                SESSIONS.move_to_end(copied_session.session_id)
+                while len(SESSIONS) > SESSIONS_MAX:
+                    SESSIONS.popitem(last=False)
+            # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
+            # accidentally avoided this because `/api/session/rename` calls `s.save()`.
+            # Without this explicit save, the duplicate is in-memory only — if the user
+            # refreshes before sending a turn, the duplicate vanishes.
+            copied_session.save()
+
+            return j(handler, {"session": copied_session.compact() | {"messages": copied_session.messages}})
+        except Exception as e:
+            return bad(handler, str(e))
+
     if parsed.path == "/api/default-model":
         try:
             return j(handler, set_hermes_default_model(body.get("model")))
@@ -2505,6 +2577,36 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/onboarding/complete":
         return j(handler, complete_onboarding())
+
+    if parsed.path == "/api/onboarding/probe":
+        # Probe a self-hosted provider endpoint (#1499).  Validates the
+        # configured base URL is reachable + parses /models, returns the
+        # model catalog so the wizard can populate its dropdown.
+        # Read-only: no config.yaml or .env writes happen here.  Same local-
+        # network gate as /api/onboarding/setup (also writing-adjacent in
+        # spirit because it carries an api_key the user typed).
+        from api.auth import is_auth_enabled
+        import os as _os
+        if not is_auth_enabled() and not _os.getenv("HERMES_WEBUI_ONBOARDING_OPEN"):
+            import ipaddress
+            try:
+                _xff = handler.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                _xri = handler.headers.get("X-Real-IP", "").strip()
+                _raw = handler.client_address[0]
+                _ip_str = _xff or _xri or _raw
+                addr = ipaddress.ip_address(_ip_str)
+                is_local = addr.is_loopback or addr.is_private
+            except ValueError:
+                is_local = False
+            if not is_local:
+                return bad(handler, "Onboarding probe is only available from local networks when auth is not enabled. To bypass this on a remote server, set HERMES_WEBUI_ONBOARDING_OPEN=1.", 403)
+        provider = str((body or {}).get("provider") or "").strip().lower()
+        base_url = str((body or {}).get("base_url") or "")
+        api_key = str((body or {}).get("api_key") or "").strip() or None
+        try:
+            return j(handler, probe_provider_endpoint(provider, base_url, api_key))
+        except Exception as e:
+            return bad(handler, f"probe failed: {e}", 500)
 
     # ── Session pin (POST) ──
     if parsed.path == "/api/session/pin":

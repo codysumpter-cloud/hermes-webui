@@ -283,12 +283,21 @@ function closeLiveStream(sessionId, streamId){
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
-  closeLiveStream(activeSid);
   if(!INFLIGHT[activeSid]) INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[...uploaded],toolCalls:[]};
   else {
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
+  const existingLive=LIVE_STREAMS[activeSid];
+  if(
+    existingLive&&existingLive.streamId===streamId&&existingLive.source&&
+    // A same-stream transport can be reused unless the browser has already
+    // marked it closed; closed streams must still fall through to reopen.
+    (typeof EventSource==='undefined'||existingLive.source.readyState!==EventSource.CLOSED)
+  ){
+    return;
+  }
+  closeLiveStream(activeSid);
 
   let assistantText='';
   let reasoningText='';
@@ -827,6 +836,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const _prevOut=(S.session&&S.session.output_tokens)||0;
         const _prevCost=(S.session&&S.session.estimated_cost)||0;
         S.session=d.session;S.messages=d.session.messages||[];if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
+        if(S.session&&S.session.session_id){
+          localStorage.setItem('hermes-webui-session',S.session.session_id);
+          if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
+        }
         if(
           window._compressionUi&&window._compressionUi.automatic&&
           window._compressionUi.sessionId===activeSid&&
@@ -1092,6 +1105,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         S.activeStreamId=null;
         clearLiveToolCards();if(!assistantText)removeThinking();
         S.session=session;S.messages=(session.messages||[]).filter(m=>m&&m.role);
+        if(S.session&&S.session.session_id){
+          localStorage.setItem('hermes-webui-session',S.session.session_id);
+          if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(S.session.session_id);
+        }
         const hasMessageToolMetadata=S.messages.some(m=>{
           if(!m||m.role!=='assistant') return false;
           // Recognize both the standard `tool_calls` (used by completed assistant

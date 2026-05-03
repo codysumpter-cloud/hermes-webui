@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 import api.config as _cfg
@@ -479,6 +480,7 @@ class Session:
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
             **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
             'active_stream_id': self.active_stream_id,
+            'pending_user_message': self.pending_user_message,
             'is_cli_session': self.is_cli_session,
             'source_tag': self.source_tag,
             'session_source': self.session_source,
@@ -1039,6 +1041,16 @@ def get_cli_sessions() -> list:
                                     break
                     except Exception:
                         pass  # degrade gracefully
+            # If a WebUI JSON file exists for this session (e.g. previously
+            # imported or renamed in the sidebar), prefer its title over the
+            # state.db title.  This fixes rename-not-persisting for CLI sessions
+            # after compression chain extension (#1486).
+            try:
+                _webui_meta = Session.load_metadata_only(sid)
+                if _webui_meta and getattr(_webui_meta, 'title', None):
+                    _title = _webui_meta.title
+            except Exception:
+                pass
             _display_title = _title or f'{_source.title()} Session'
             cli_sessions.append({
                 'session_id': sid,
@@ -1057,6 +1069,10 @@ def get_cli_sessions() -> list:
                 'session_source': row.get('session_source'),
                 'source_label': row.get('source_label'),
                 'parent_session_id': row.get('parent_session_id'),
+                'parent_title': row.get('parent_title'),
+                'parent_source': row.get('parent_source'),
+                'relationship_type': row.get('relationship_type'),
+                '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
                 '_lineage_root_id': row.get('_lineage_root_id'),
                 '_lineage_tip_id': row.get('_lineage_tip_id'),
                 '_compression_segment_count': row.get('_compression_segment_count'),
@@ -1096,7 +1112,7 @@ def get_cli_session_messages(sid) -> list:
         return []
 
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing(sqlite3.connect(str(db_path))) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("""
@@ -1137,7 +1153,7 @@ def delete_cli_session(sid) -> bool:
         return False
 
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with closing(sqlite3.connect(str(db_path))) as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
             cur.execute("DELETE FROM sessions WHERE id = ?", (sid,))

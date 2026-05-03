@@ -1506,10 +1506,17 @@ def get_available_models() -> dict:
 
         def _norm_model_id(model_id: str) -> str:
             s = str(model_id or "").strip().lower()
+            # Strip @provider: prefix (e.g., @custom:jingdong:GLM-5 -> GLM-5).
+            # Defensive: if the last segment is empty (trailing colon, malformed
+            # config), keep the original to avoid collapsing distinct IDs to ''.
             if s.startswith("@") and ":" in s:
-                s = s.split(":", 1)[1]
+                parts = s.split(":")
+                s = parts[-1] or s
+            # Strip provider/model prefix (e.g., custom:jingdong/GLM-5 -> GLM-5).
+            # Same trailing-empty guard.
             if "/" in s:
-                s = s.split("/", 1)[1]
+                parts = s.split("/")
+                s = parts[-1] or s
             return s.replace("-", ".")
 
         def _build_configured_model_badges() -> dict[str, dict[str, str]]:
@@ -2064,11 +2071,20 @@ def get_available_models() -> dict:
                     )
                 else:
                     if auto_detected_models:
+                        # Per-group deep copy so subsequent mutation by
+                        # _deduplicate_model_ids() (which prefixes ids with
+                        # @provider_id:) does not bleed into other groups
+                        # that also fall through to this branch (#1511 root
+                        # cause: multiple unconfigured providers all sharing
+                        # the same auto_detected_models list reference would
+                        # see every group's id rewritten to the FIRST
+                        # provider's prefix, and labels accumulated every
+                        # provider's name).
                         groups.append(
                             {
                                 "provider": provider_name,
                                 "provider_id": pid,
-                                "models": auto_detected_models,
+                                "models": copy.deepcopy(auto_detected_models),
                             }
                         )
         else:
@@ -2079,9 +2095,8 @@ def get_available_models() -> dict:
                 )
 
         if default_model:
-            _norm = lambda mid: (mid.split("/", 1)[-1] if "/" in mid else mid).replace("-", ".")
-            all_ids_norm = {_norm(m["id"]) for g in groups for m in g.get("models", [])}
-            if _norm(default_model) not in all_ids_norm:
+            all_ids_norm = {_norm_model_id(m["id"]) for g in groups for m in g.get("models", [])}
+            if _norm_model_id(default_model) not in all_ids_norm:
                 label = _get_label_for_model(default_model, groups)
                 target_display = (
                     _PROVIDER_DISPLAY.get(active_provider, active_provider or "").lower()
