@@ -313,6 +313,114 @@ def _profile_home_for_cron_job(job: dict):
     return get_hermes_home_for_profile(raw)
 
 
+def _cron_job_subprocess_main(job, execution_profile_home, result_queue):
+    """Run one cron job inside a child process pinned to a profile home."""
+    try:
+        def _run():
+            from cron.scheduler import run_job
+
+            return run_job(job)
+
+        if execution_profile_home is None:
+            result = _run()
+        else:
+            from api.profiles import cron_profile_context_for_home
+
+            with cron_profile_context_for_home(execution_profile_home):
+                result = _run()
+        result_queue.put(("ok", result))
+    except BaseException as exc:  # pragma: no cover - surfaced in parent
+        import traceback
+
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}", traceback.format_exc()))
+
+
+def _cron_subprocess_result_timeout_seconds(job):
+    """Return how long the manual-run parent waits for child result payloads."""
+    for key in ("timeout_seconds", "max_runtime_seconds", "timeout"):
+        raw = (job or {}).get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return max(60.0, value + 30.0)
+    # Manual cron jobs can legitimately run for a long time.  Keep a recovery
+    # path for wedged children without truncating normal long-running jobs.
+    return 6 * 60 * 60.0
+
+
+def _run_cron_job_in_profile_subprocess(job, execution_profile_home):
+    """Execute cron.scheduler.run_job without holding the parent cron env lock.
+
+    cron.scheduler/cron.jobs still rely on process-global HERMES_HOME and module
+    constants, so running the job body in a child process gives each long cron
+    execution its own globals. The parent process only uses cron_profile_context
+    for short metadata reads/writes and remains responsive to unrelated cron UI
+    and API calls while the job runs.
+    """
+    import multiprocessing
+    import queue
+
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_cron_job_subprocess_main,
+        args=(job, execution_profile_home, result_queue),
+    )
+    process.start()
+
+    result_timeout = _cron_subprocess_result_timeout_seconds(job)
+    status = "error"
+    payload = ["cron run subprocess failed before producing a result", ""]
+    try:
+        try:
+            # Drain the potentially large pickled result before joining.  If the
+            # child puts >~64 KiB on a multiprocessing.Queue, joining first can
+            # deadlock while the child's feeder thread waits for the parent to
+            # read from the pipe.
+            status, *payload = result_queue.get(timeout=result_timeout)
+        except queue.Empty:
+            status = "error"
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                payload = [
+                    f"cron run subprocess produced no result within {result_timeout:g}s and was terminated",
+                    "",
+                ]
+            else:
+                payload = [
+                    f"cron run subprocess exited with code {process.exitcode} without producing a result",
+                    "",
+                ]
+        finally:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                if status == "ok":
+                    status = "error"
+                    payload = [
+                        "cron run subprocess did not exit after returning a result",
+                        "",
+                    ]
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+
+    if status == "ok":
+        return payload[0]
+
+    message = payload[0]
+    traceback_text = payload[1] if len(payload) > 1 else ""
+    if traceback_text:
+        logger.error("Manual cron subprocess failed:\n%s", traceback_text)
+    raise RuntimeError(message)
+
+
 def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
     """Wrapper that tracks running state around cron.scheduler.run_job.
 
@@ -321,7 +429,6 @@ def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
     agent config/.env while running. When no job profile is selected, both homes
     are the same and legacy server-default behavior is preserved.
     """
-    from cron.scheduler import run_job  # import here — runs inside a worker thread
     from cron.jobs import mark_job_run, save_job_output
 
     job_id = job.get("id", "")
@@ -336,8 +443,8 @@ def _run_cron_tracked(job, profile_home=None, execution_profile_home=None):
             return fn()
 
     try:
-        success, output, final_response, error = _with_cron_home(
-            execution_profile_home, lambda: run_job(job)
+        success, output, final_response, error = _run_cron_job_in_profile_subprocess(
+            job, execution_profile_home
         )
 
         # Persist output and run metadata back to the job's owning cron store,
@@ -1384,6 +1491,7 @@ from api.workspace import (
     resolve_trusted_workspace,
     validate_workspace_to_add,
     _is_blocked_system_path,
+    _strip_surrounding_quotes,
     _workspace_blocked_roots,
 )
 from api.upload import handle_upload, handle_upload_extract, handle_transcribe
@@ -3183,7 +3291,34 @@ def handle_get(handler, parsed) -> bool:
         import datetime
         identity_map = _load_gateway_session_identity_map()
         sessions_path = _gateway_session_metadata_path()
-        running = bool(identity_map)
+
+        # Detect whether the gateway process is alive, independent of
+        # connected messaging platforms.  An empty identity_map just
+        # means zero platforms connected, not that the gateway is down.
+        #
+        # agent_health.build_agent_health_payload() is the authoritative
+        # signal: it reads gateway.status runtime metadata and returns a
+        # tri-state `alive` field (True/False/None).  This avoids the
+        # false-negative where the gateway is running but has zero active
+        # messaging sessions (empty identity_map).
+        #
+        # `alive` tri-state semantics:
+        #   True  → gateway process is alive
+        #   False → gateway metadata exists but process is down
+        #   None  → no gateway metadata/status available; this WebUI
+        #           setup is probably not configured with a gateway
+        health = build_agent_health_payload()
+        alive = health.get("alive")
+        if alive is True:
+            running = True
+            configured = True
+        elif alive is False:
+            running = False
+            configured = True
+        else:  # alive is None → gateway not configured / unavailable
+            running = bool(identity_map)
+            configured = False
+
         platforms_set: set[str] = set()
         for meta in identity_map.values():
             raw = meta.get("raw_source") or meta.get("platform") or ""
@@ -3210,6 +3345,7 @@ def handle_get(handler, parsed) -> bool:
                 pass
         return j(handler, {
             "running": running,
+            "configured": configured,
             "platforms": platforms,
             "last_active": last_active,
             "session_count": len(identity_map),
@@ -3885,6 +4021,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/file/reveal":
         return _handle_file_reveal(handler, body)
+
+    if parsed.path == "/api/file/path":
+        return _handle_file_path(handler, body)
 
     # ── Workspace management (POST) ──
     if parsed.path == "/api/workspaces/add":
@@ -6122,9 +6261,13 @@ def _handle_chat_sync(handler, body):
             # Resolve API key via Hermes runtime provider (matches gateway behaviour)
             _api_key = None
             try:
+                from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
 
-                _rt = resolve_runtime_provider(requested=_provider)
+                _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                    resolve_runtime_provider,
+                    requested=_provider,
+                )
                 _api_key = _rt.get("api_key")
                 # Also use runtime provider/base_url if the webui config didn't resolve them
                 if not _provider:
@@ -6483,7 +6626,13 @@ def _handle_file_reveal(handler, body):
     try:
         target = safe_resolve(Path(s.workspace), body["path"])
         if not target.exists():
-            return bad(handler, "File not found", 404)
+            # Include the resolved server-side path in the error message so
+            # the frontend toast can show *which* file the system expected.
+            # Useful when a stale session row still references a deleted file
+            # (#1764 — Cygnus's screenshot showed a "Failed to reveal: not
+            # found" toast that dropped the path entirely, leaving no clue
+            # what was missing).
+            return bad(handler, f"File not found: {target}", 404)
 
         system = platform.system()
         if system == "Darwin":
@@ -6499,8 +6648,43 @@ def _handle_file_reveal(handler, body):
         return bad(handler, _sanitize_error(e))
 
 
+def _handle_file_path(handler, body):
+    """Resolve a relative workspace-rooted path into an absolute on-disk path.
+
+    The right-click "Copy file path" action (#1764) wants to put the
+    absolute path on the user's clipboard so they can paste it into a
+    terminal, editor, or anywhere else without having to round-trip through
+    the OS file browser. The frontend can't compute the absolute path on
+    its own — `safe_resolve` joins against the session's workspace root
+    which only the server knows. The handler here is a thin lookup; no
+    filesystem mutation, no OS-specific dispatch. We do NOT require the
+    target to exist (unlike `_handle_file_reveal`) — copying the path of a
+    just-deleted file is still useful, and refusing would force callers
+    to special-case 404s for an action that cannot fail destructively.
+    """
+    try:
+        require(body, "session_id", "path")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        s = get_session(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        target = safe_resolve(Path(s.workspace), body["path"])
+        return j(handler, {"ok": True, "path": str(target)})
+    except (ValueError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
+
+
 def _handle_workspace_add(handler, body):
-    path_str = body.get("path", "").strip()
+    # Strip surrounding paired quotes BEFORE any further processing — macOS
+    # Finder's "Copy as Pathname" wraps paths in single quotes, and users
+    # routinely paste those quoted strings into the Add Space input.
+    # Doing this at the route entry means every downstream check (blocked
+    # system path, validate_workspace_to_add, duplicate detection) sees the
+    # cleaned form.
+    path_str = _strip_surrounding_quotes(body.get("path", "").strip())
     name = body.get("name", "").strip()
     auto_create = body.get("create", False)
     if not path_str:
@@ -6835,6 +7019,7 @@ def _handle_session_compress(handler, body):
                 )
 
         import api.config as _cfg
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
         import run_agent as _run_agent
 
@@ -6844,7 +7029,10 @@ def _handle_session_compress(handler, body):
 
         resolved_api_key = None
         try:
-            _rt = _runtime_provider.resolve_runtime_provider(requested=resolved_provider)
+            _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                _runtime_provider.resolve_runtime_provider,
+                requested=resolved_provider,
+            )
             resolved_api_key = _rt.get("api_key")
             if not resolved_provider:
                 resolved_provider = _rt.get("provider")
@@ -7436,6 +7624,7 @@ def _handle_handoff_summary(handler, body):
         # Call LLM for summary.
     try:
         import api.config as _cfg
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
         import hermes_cli.runtime_provider as _runtime_provider
         import run_agent as _run_agent
 
@@ -7454,7 +7643,10 @@ def _handle_handoff_summary(handler, body):
 
         resolved_api_key = None
         try:
-            _rt = _runtime_provider.resolve_runtime_provider(requested=resolved_provider)
+            _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                _runtime_provider.resolve_runtime_provider,
+                requested=resolved_provider,
+            )
             resolved_api_key = _rt.get("api_key")
             if not resolved_provider:
                 resolved_provider = _rt.get("provider")
@@ -7669,6 +7861,49 @@ def _normalize_message_for_import_refresh(message: object) -> object:
     return normalized
 
 
+def _message_has_cli_tool_metadata(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") == "assistant" and message.get("tool_calls"):
+        return True
+    if message.get("role") == "tool" and (message.get("tool_call_id") or message.get("tool_name") or message.get("name")):
+        return True
+    return False
+
+
+def _strip_cli_tool_metadata_for_refresh(message: object) -> object:
+    if not isinstance(message, dict):
+        return _normalize_message_for_import_refresh(message)
+    normalized = _normalize_message_for_import_refresh(message)
+    if not isinstance(normalized, dict):
+        return normalized
+    for key in ("tool_calls", "tool_call_id", "tool_name", "name"):
+        normalized.pop(key, None)
+    return normalized
+
+
+def _is_cli_tool_metadata_enrichment(existing_messages: list, fresh_messages: list) -> bool:
+    """Return True when fresh messages only add CLI tool metadata.
+
+    Older imports from get_cli_session_messages() persisted assistant/tool rows
+    without tool_calls, tool_call_id, or tool_name. After #1772 the refreshed
+    transcript can have the same length but richer metadata, so re-imports must
+    rebuild the stored sidecar even without a new row.
+    """
+    if not isinstance(existing_messages, list) or not isinstance(fresh_messages, list):
+        return False
+    if len(existing_messages) != len(fresh_messages):
+        return False
+    if any(_message_has_cli_tool_metadata(m) for m in existing_messages):
+        return False
+    if not any(_message_has_cli_tool_metadata(m) for m in fresh_messages):
+        return False
+    for idx, existing_message in enumerate(existing_messages):
+        if _strip_cli_tool_metadata_for_refresh(existing_message) != _strip_cli_tool_metadata_for_refresh(fresh_messages[idx]):
+            return False
+    return True
+
+
 def _is_messages_refresh_prefix_match(existing_messages: list, fresh_messages: list) -> bool:
     """Return True when existing_messages is a prefix of fresh_messages by value.
 
@@ -7713,6 +7948,11 @@ def _handle_session_import_cli(handler, body):
             if _is_messages_refresh_prefix_match(existing.messages, fresh_msgs):
                 existing.messages = fresh_msgs
                 changed = True
+        elif fresh_msgs and _is_cli_tool_metadata_enrichment(existing.messages, fresh_msgs):
+            # Same row count, richer payload: rebuild sidecars imported before
+            # CLI tool metadata was preserved (#1772).
+            existing.messages = fresh_msgs
+            changed = True
         if cli_meta:
             updates = {
                 "is_cli_session": True,

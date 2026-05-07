@@ -321,7 +321,7 @@
   .sidebar-section{padding:14px 14px 8px;}
   .new-chat-btn{width:100%;padding:9px 12px;border-radius:9px;background:var(--accent-bg);border:1px solid var(--accent-bg-strong);color:var(--accent-text);font-size:13px;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all .15s;margin-bottom:8px;font-weight:500;}
   .new-chat-btn:hover{background:var(--accent-bg-strong);border-color:var(--accent);}
-  .session-list{flex:1;overflow-y:auto;padding:0 8px 8px;min-height:0;}
+  .session-list{flex:1;overflow-y:auto;padding:0 8px 8px;min-height:0;overscroll-behavior-y:contain;touch-action:pan-y;}
   .sidebar-search{position:relative;padding:8px 12px;flex-shrink:0;}
   .sidebar-search input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:7px 10px 7px 32px;font-size:13px;outline:none;transition:border-color .15s,box-shadow .15s,background .15s;box-sizing:border-box;}
   .sidebar-search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg);}
@@ -643,10 +643,44 @@
   .rail-btn{width:36px;height:36px;border-radius:8px;border:none;background:none;color:var(--muted);cursor:pointer;display:flex;align-items:center;justify-content:center;position:relative;transition:color .15s,background .15s;flex-shrink:0;padding:0;}
   .rail-btn:hover{color:var(--text);background:var(--hover-bg);}
   .rail-btn.active{color:var(--accent-text);background:var(--accent-bg);}
-  .rail-btn.active::before{content:'';position:absolute;left:-6px;top:50%;transform:translateY(-50%);width:3px;height:16px;background:var(--accent);border-radius:0 2px 2px 0;}
-  .rail-spacer{flex:1;min-height:8px;}
-  .rail .nav-tab{flex:0 0 auto;padding:0;font-size:inherit;border-bottom:none;overflow:visible;}
-  .rail .nav-tab:hover::after{content:none;}
+.rail-btn.active::before{content:'';position:absolute;left:-6px;top:50%;transform:translateY(-50%);width:3px;height:16px;background:var(--accent);border-radius:0 2px 2px 0;}
+  /* Custom tooltip — replaces native title="" for faster, more polished display.
+     Native browser tooltips have a ~1.5s hover delay that reads as "no tooltip
+     exists" (#1775). Our custom tooltip appears at ~150ms hover, dismisses
+     instantly, and renders above all sidebar/panel stacking contexts. */
+  /* Usage: add data-tooltip="Label" and class="has-tooltip". For i18n, pair
+     with data-i18n-title; static/i18n.js will sync the localized value into
+     data-tooltip and clear any stale native title attribute. */
+  /* Design choice: no arrow/caret. At 11px text size and 5px arrow size the
+     triangle reads as visual noise rather than a connector — VS Code, Slack,
+     and Linear's rail tooltips also skip the arrow. Spatial proximity (8px
+     gap) is enough to associate the tooltip with the trigger. */
+  .has-tooltip{position:relative;}
+  .has-tooltip::after{content:attr(data-tooltip);position:absolute;left:calc(100% + 8px);top:50%;transform:translateY(-50%);background:var(--surface);border:1px solid var(--accent-bg-strong);color:var(--text);font-size:11.5px;font-weight:600;letter-spacing:.02em;padding:5px 10px;border-radius:6px;white-space:nowrap;pointer-events:none;z-index:1500;box-shadow:0 8px 24px rgba(0,0,0,.65),0 0 0 1px rgba(0,0,0,.35),0 1px 0 rgba(255,255,255,.04) inset;opacity:0;transition:opacity .14s ease;transition-delay:0s;}
+  .has-tooltip:hover::after,.has-tooltip:focus-visible::after{opacity:1;transition-delay:.15s;}
+  /* For bottom-positioned tooltips (panel header buttons, non-rail elements) */
+  .has-tooltip--bottom::after{left:50%;top:auto;bottom:auto;transform:translateX(-50%);top:calc(100% + 8px);}
+  /* For bottom-positioned tooltips on a trigger that sits flush with its
+     container's right edge — anchors the tooltip's RIGHT edge to the trigger
+     so the label extends inward (to the left) instead of overflowing past the
+     panel edge. Used for the `+` New conversation button at the right of the
+     chat panel header. Pairs with `--bottom`; do not apply both. */
+  .has-tooltip--bottom-right::after{left:auto;right:0;top:calc(100% + 8px);bottom:auto;transform:none;}
+  /* For right-edge elements (e.g. send button) — tooltip flips to the LEFT
+     of the trigger so it doesn't extend past the viewport edge. */
+  .has-tooltip--left::after{left:auto;right:calc(100% + 8px);top:50%;transform:translateY(-50%);}
+  @media(prefers-reduced-motion:reduce){.has-tooltip::after{transition:none;transition-delay:0s;}}
+.rail-spacer{flex:1;min-height:8px;}
+.rail .nav-tab{flex:0 0 auto;padding:0;font-size:inherit;border-bottom:none;overflow:visible;}
+/* Note: previously this block had `.rail .nav-tab:hover::after { content: none }`
+   to suppress the legacy `.nav-tab:hover::after { content: attr(data-label) }`
+   tooltip (line ~681 below) on the desktop rail. After v0.51.17 migrated the
+   rail to the custom `.has-tooltip` system, that suppression rule survived and
+   blocked the new tooltips because `.rail .nav-tab:hover::after` (specificity
+   0,3,1) outweighs `.has-tooltip:hover::after` (0,2,1) and `content:none`
+   removes the pseudo-element entirely. Solution: scope the legacy
+   `.nav-tab:hover::after` data-label tooltip to `.sidebar-nav` (mobile) only
+   (see line ~681). The rail rule is no longer needed. */
   .rail .nav-tab.active::before{content:'';position:absolute;left:-6px;top:50%;bottom:auto;transform:translateY(-50%);width:3px;height:16px;background:var(--accent);border-radius:0 2px 2px 0;}
   .dashboard-link{position:relative;}
   .dashboard-link-visible{display:flex!important;}
@@ -658,7 +692,13 @@
   .sidebar-nav{display:flex;border-bottom:1px solid var(--border);flex-shrink:0;padding:6px 8px 0;gap:2px;}
   .nav-tab{flex:1;padding:10px 4px 8px;font-size:20px;text-align:center;cursor:pointer;color:var(--muted);border:none;background:none;transition:color .15s;border-bottom:2px solid transparent;white-space:nowrap;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center;}
   .nav-tab:hover{color:var(--text);}
-  .nav-tab:hover::after{content:attr(data-label);position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:var(--surface);border:1px solid var(--accent-bg-strong);color:var(--accent-text);font-size:12px;font-weight:700;letter-spacing:.02em;padding:6px 12px;border-radius:8px;white-space:nowrap;pointer-events:none;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.3);}
+  /* Legacy hover-tooltip — kept for the mobile `.sidebar-nav` only, where it
+     positions ABOVE the trigger (the bar is at the top of the sidebar so a
+     bottom-positioned tooltip would sink into the panel content). The desktop
+     `.rail` buttons opt out of this rule so the `.has-tooltip` system can run
+     unobstructed; rail buttons carry no `data-label`, so an unscoped rule
+     would render an empty styled box on hover. */
+  .sidebar-nav .nav-tab:hover::after{content:attr(data-label);position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:var(--surface);border:1px solid var(--accent-bg-strong);color:var(--accent-text);font-size:12px;font-weight:700;letter-spacing:.02em;padding:6px 12px;border-radius:8px;white-space:nowrap;pointer-events:none;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.3);}
   .nav-tab.active{color:var(--accent-text);}
   .nav-tab.active::before{content:'';position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:20px;height:2px;background:var(--accent);border-radius:2px 2px 0 0;}
   /* Panel content areas (swapped by tab) */
@@ -761,6 +801,9 @@
   .msg-body code{font-family:"SF Mono","Fira Code",ui-monospace,monospace;font-size:12.5px;background:var(--code-inline-bg);padding:1px 5px;border-radius:4px;color:var(--code-text);}
   .msg-body pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:14px 16px;overflow-x:auto;margin:10px 0;}
   .msg-body pre code{background:none;padding:0;border-radius:0;color:var(--pre-text);font-size:13px;line-height:1.6;}
+  .provider-error-details{margin:12px 0 0;border:1px solid var(--border);border-radius:10px;background:var(--surface);overflow:hidden;}
+  .provider-error-details>summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:600;padding:8px 12px;}
+  .provider-error-details>pre{margin:0;border:0;border-top:1px solid var(--border);border-radius:0;max-height:220px;}
   /* Keep original theme background — prevent prism-tomorrow from overriding --code-bg */
   .msg-body pre[class*="language-"],.msg-body pre code[class*="language-"]{background:var(--code-bg) !important;}
   /* Fix #1463: Prism YAML grammar collapses newlines inside token spans — force pre */
@@ -894,7 +937,10 @@
   .attach-chip--audio,.attach-chip--video{max-width:260px;}
   .attach-media-icon{display:inline-flex;align-items:center;color:var(--accent-text);}
   .attach-chip-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .attach-thumb{width:56px;height:56px;object-fit:cover;border-radius:4px;display:block;cursor:default;}
+  .attach-thumb{width:56px;height:56px;object-fit:cover;border-radius:4px;display:block;cursor:zoom-in;transition:filter .12s ease, transform .12s ease;}
+  @media (hover: hover) {
+    .attach-thumb:hover{filter:brightness(1.05);transform:scale(1.04);}
+  }
   textarea#msg{width:100%;background:transparent;border:none;outline:none;color:var(--text);font-size:16px;line-height:1.65;padding:12px 16px 6px;resize:none;min-height:44px;max-height:200px;font-family:inherit;}
   textarea#msg::placeholder{color:var(--muted);}
   .composer-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px 10px;position:relative;container-type:inline-size;container-name:composer-footer;}
@@ -1108,7 +1154,7 @@
   /* Collapse priority as the panel narrows: git-badge first, then "Workspace"
      label, never the icon buttons. flex-shrink ratios give graceful ellipsis;
      @container queries below cut to display:none at hard breakpoints. */
-  .panel-header{padding:12px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;display:flex;align-items:center;gap:6px;overflow:hidden;}
+  .panel-header{padding:12px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;display:flex;align-items:center;gap:6px;overflow:visible;}
   .panel-header > span:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex-shrink:2;}
   .git-badge{font-size:9px;font-weight:600;color:var(--muted);background:var(--hover-bg);padding:2px 7px;border-radius:4px;letter-spacing:.02em;white-space:nowrap;font-family:'SF Mono',ui-monospace,monospace;flex-shrink:3;overflow:hidden;min-width:0;}
   .topbar-source-badge{display:inline-flex;align-items:center;margin-left:6px;padding:2px 7px;border-radius:999px;background:var(--accent-bg);color:var(--accent-text);font-size:10px;font-weight:700;letter-spacing:.02em;vertical-align:middle;}
